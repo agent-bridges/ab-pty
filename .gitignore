@@ -1,0 +1,6 @@
+out/
+data/
+dot-claude/
+.artifacts/
+ab-pty
+.DS_Store

@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example v0.1.2)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate VERSION against git tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            release_tag="${{ inputs.tag }}"
+          else
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          tag_version="${release_tag#v}"
+          if [[ -z "${file_version}" ]]; then
+            echo "VERSION file is empty" >&2
+            exit 1
+          fi
+          if [[ "${file_version}" != "${tag_version}" ]]; then
+            echo "VERSION (${file_version}) does not match release tag (${tag_version})" >&2
+            exit 1
+          fi
+          echo "version=${file_version}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+
+  build-binaries:
+    needs: validate-version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            cc: gcc
+            packages: build-essential file
+            artifact: ab-pty-linux-amd64-glibc
+          - goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            packages: build-essential gcc-aarch64-linux-gnu libc6-dev-arm64-cross file
+            artifact: ab-pty-linux-arm64-glibc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
+      - name: Build release binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" CC="${CC}" \
+            go build \
+            -trimpath \
+            -ldflags "-s -w -X main.Version=${VERSION}" \
+            -o "dist/${ARTIFACT}" \
+            .
+          chmod +x "dist/${ARTIFACT}"
+          file "dist/${ARTIFACT}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  publish-release:
+    needs:
+      - validate-version
+      - build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Flatten artifact directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -maxdepth 2 -type f -print0 | while IFS= read -r -d '' file; do
+            cp "${file}" "release/$(basename "${file}")"
+          done
+          (
+            cd release
+            sha256sum ab-pty-linux-*-glibc > SHA256SUMS
+          )
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2.6.1
+        with:
+          tag_name: ${{ needs.validate-version.outputs.release_tag }}
+          body: |
+            Published daemon binaries:
+            - linux/amd64 (glibc)
+            - linux/arm64 (glibc)
+
+            Files:
+            - ab-pty-linux-amd64-glibc
+            - ab-pty-linux-arm64-glibc
+            - SHA256SUMS
+          files: |
+            release/ab-pty-linux-amd64-glibc
+            release/ab-pty-linux-arm64-glibc
+            release/SHA256SUMS

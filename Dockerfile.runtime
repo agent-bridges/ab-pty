@@ -1,0 +1,26 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash procps curl ca-certificates nodejs npm jq locales inotify-tools \
+    && sed -i 's/# ru_RU.UTF-8/ru_RU.UTF-8/' /etc/locale.gen \
+    && sed -i 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen \
+    && locale-gen && rm -rf /var/lib/apt/lists/*
+
+# Claude Code
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Codex
+RUN npm install -g @openai/codex
+
+ENV PATH="/root/.local/bin:${PATH}"
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+RUN echo 'export PATH="/root/.local/bin:$PATH"' >> /root/.bashrc
+
+COPY claudes /usr/local/bin/claudes
+RUN chmod +x /usr/local/bin/claudes
+
+COPY claude-hook-forwarder.sh /usr/local/bin/claude-hook-forwarder
+RUN chmod +x /usr/local/bin/claude-hook-forwarder
+
+WORKDIR /app
