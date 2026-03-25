@@ -795,6 +795,10 @@ Environment variables:
 	// Protected endpoints (require JWT if secret configured)
 	http.HandleFunc("/api/pty", jwtMiddleware(handleListPty))
 	http.HandleFunc("/api/pty/", jwtMiddleware(handlePtyAPI))
+	http.HandleFunc("/api/board/items", jwtMiddleware(handleBoardItems))
+	http.HandleFunc("/api/board/items/", jwtMiddleware(handleBoardItems))
+	http.HandleFunc("/api/board/layouts", jwtMiddleware(handleBoardLayouts))
+	http.HandleFunc("/api/board/layouts/", jwtMiddleware(handleBoardLayouts))
 	http.HandleFunc("/api/projects", jwtMiddleware(handleListProjects))
 	http.HandleFunc("/api/projects/", jwtMiddleware(handleProjectsAPI))
 	http.HandleFunc("/api/sessions/", jwtMiddleware(handleSessionsAPI))
@@ -876,6 +880,34 @@ func initDB() {
 		log.Fatal(err)
 	}
 
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS board_items (
+			id TEXT PRIMARY KEY,
+			type TEXT NOT NULL,
+			label TEXT DEFAULT '',
+			pty_id TEXT,
+			note_content TEXT,
+			current_path TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS board_layouts (
+			name TEXT PRIMARY KEY,
+			snapshot TEXT NOT NULL,
+			saved_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Migration: add active column if not exists
 	db.Exec(`ALTER TABLE session_meta ADD COLUMN active INTEGER DEFAULT 0`)
 
@@ -916,6 +948,206 @@ func initDB() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+type BoardItemRecord struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Label       string `json:"label"`
+	PtyID       string `json:"ptyId,omitempty"`
+	NoteContent string `json:"noteContent,omitempty"`
+	CurrentPath string `json:"currentPath,omitempty"`
+}
+
+type BoardLayoutRecord struct {
+	Name     string                 `json:"name"`
+	SavedAt  string                 `json:"savedAt"`
+	Snapshot map[string]interface{} `json:"snapshot"`
+}
+
+func listBoardItems() ([]map[string]interface{}, error) {
+	rows, err := db.Query(`
+		SELECT id, type, label, pty_id, note_content, current_path
+		FROM board_items
+		ORDER BY updated_at DESC, created_at DESC, id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var id, itemType, label string
+		var ptyID, noteContent, currentPath sql.NullString
+		if err := rows.Scan(&id, &itemType, &label, &ptyID, &noteContent, &currentPath); err != nil {
+			return nil, err
+		}
+
+		items = append(items, map[string]interface{}{
+			"id":          id,
+			"type":        itemType,
+			"x":           0,
+			"y":           0,
+			"label":       label,
+			"ptyId":       ptyID.String,
+			"noteContent": noteContent.String,
+			"currentPath": currentPath.String,
+			"window":      nil,
+		})
+	}
+
+	return items, rows.Err()
+}
+
+func upsertBoardItem(item BoardItemRecord) error {
+	if item.ID == "" {
+		return fmt.Errorf("missing item id")
+	}
+	if item.Type == "" {
+		return fmt.Errorf("missing item type")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.Exec(`
+		INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			type = excluded.type,
+			label = excluded.label,
+			pty_id = excluded.pty_id,
+			note_content = excluded.note_content,
+			current_path = excluded.current_path,
+			updated_at = excluded.updated_at
+	`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now)
+	return err
+}
+
+func deleteBoardItem(itemID string) (bool, error) {
+	result, err := db.Exec(`DELETE FROM board_items WHERE id = ?`, itemID)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
+}
+
+func syncBoardItems(items []BoardItemRecord) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM board_items`); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, item := range items {
+		if item.ID == "" || item.Type == "" {
+			return fmt.Errorf("invalid board item")
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func listBoardLayouts() ([]map[string]interface{}, error) {
+	rows, err := db.Query(`SELECT name, snapshot, saved_at FROM board_layouts ORDER BY saved_at DESC, name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	layouts := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var name, snapshotJSON, savedAt string
+		if err := rows.Scan(&name, &snapshotJSON, &savedAt); err != nil {
+			return nil, err
+		}
+		var snapshot map[string]interface{}
+		if err := json.Unmarshal([]byte(snapshotJSON), &snapshot); err != nil {
+			return nil, err
+		}
+
+		layouts = append(layouts, map[string]interface{}{
+			"name":     name,
+			"savedAt":  savedAt,
+			"snapshot": snapshot,
+		})
+	}
+
+	return layouts, rows.Err()
+}
+
+func getBoardLayout(name string) (*BoardLayoutRecord, error) {
+	var snapshotJSON, savedAt string
+	row := db.QueryRow(`SELECT snapshot, saved_at FROM board_layouts WHERE name = ?`, name)
+	if err := row.Scan(&snapshotJSON, &savedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var snapshot map[string]interface{}
+	if err := json.Unmarshal([]byte(snapshotJSON), &snapshot); err != nil {
+		return nil, err
+	}
+
+	return &BoardLayoutRecord{
+		Name:     name,
+		SavedAt:  savedAt,
+		Snapshot: snapshot,
+	}, nil
+}
+
+func saveBoardLayout(name string, snapshot map[string]interface{}) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("missing layout name")
+	}
+
+	snapshotJSON, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = db.Exec(`
+		INSERT INTO board_layouts (name, snapshot, saved_at, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET
+			snapshot = excluded.snapshot,
+			saved_at = excluded.saved_at,
+			updated_at = excluded.updated_at
+	`, name, string(snapshotJSON), now, now)
+	if err != nil {
+		return "", err
+	}
+
+	return now, nil
+}
+
+func deleteBoardLayout(name string) (bool, error) {
+	result, err := db.Exec(`DELETE FROM board_layouts WHERE name = ?`, name)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
 }
 
 func getSessionMeta(sessionID string) *SessionMeta {
@@ -2483,6 +2715,155 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		writeError(w, 404, "Not found")
+	}
+}
+
+func handleBoardItems(w http.ResponseWriter, r *http.Request) {
+	if allowOptions(w, r, "GET, PUT, POST, DELETE, OPTIONS") {
+		return
+	}
+
+	switch {
+	case r.URL.Path == "/api/board/items":
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		items, err := listBoardItems()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to list board items")
+			return
+		}
+		writeJSON(w, 0, items)
+		return
+
+	case r.URL.Path == "/api/board/items/sync":
+		if !requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		var payload struct {
+			Items []BoardItemRecord `json:"items"`
+		}
+		if !decodeJSONBody(w, r, &payload) {
+			return
+		}
+		if err := syncBoardItems(payload.Items); err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to sync board items")
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "count": len(payload.Items)})
+		return
+	}
+
+	if !strings.HasPrefix(r.URL.Path, "/api/board/items/") {
+		writeError(w, http.StatusNotFound, "Not found")
+		return
+	}
+
+	itemID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/board/items/"))
+	if err != nil || itemID == "" {
+		writeError(w, http.StatusBadRequest, "Invalid item id")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut:
+		var item BoardItemRecord
+		if !decodeJSONBody(w, r, &item) {
+			return
+		}
+		item.ID = itemID
+		if err := upsertBoardItem(item); err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to save board item")
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true})
+	case http.MethodDelete:
+		deleted, err := deleteBoardItem(itemID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to delete board item")
+			return
+		}
+		if !deleted {
+			writeError(w, http.StatusNotFound, "Board item not found")
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	}
+}
+
+func handleBoardLayouts(w http.ResponseWriter, r *http.Request) {
+	if allowOptions(w, r, "GET, PUT, DELETE, OPTIONS") {
+		return
+	}
+
+	if r.URL.Path == "/api/board/layouts" {
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		layouts, err := listBoardLayouts()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to list board layouts")
+			return
+		}
+		writeJSON(w, 0, layouts)
+		return
+	}
+
+	if !strings.HasPrefix(r.URL.Path, "/api/board/layouts/") {
+		writeError(w, http.StatusNotFound, "Not found")
+		return
+	}
+
+	layoutName, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/board/layouts/"))
+	if err != nil || strings.TrimSpace(layoutName) == "" {
+		writeError(w, http.StatusBadRequest, "Invalid layout name")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		layout, err := getBoardLayout(layoutName)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to load board layout")
+			return
+		}
+		if layout == nil {
+			writeError(w, http.StatusNotFound, "Layout not found")
+			return
+		}
+		writeJSON(w, 0, layout)
+	case http.MethodPut:
+		var payload struct {
+			Snapshot map[string]interface{} `json:"snapshot"`
+		}
+		if !decodeJSONBody(w, r, &payload) {
+			return
+		}
+		if payload.Snapshot == nil {
+			writeError(w, http.StatusBadRequest, "snapshot must be an object")
+			return
+		}
+		savedAt, err := saveBoardLayout(layoutName, payload.Snapshot)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to save board layout")
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "name": layoutName, "savedAt": savedAt})
+	case http.MethodDelete:
+		deleted, err := deleteBoardLayout(layoutName)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to delete board layout")
+			return
+		}
+		if !deleted {
+			writeError(w, http.StatusNotFound, "Layout not found")
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 	}
 }
 
