@@ -884,6 +884,8 @@ func initDB() {
 		CREATE TABLE IF NOT EXISTS board_items (
 			id TEXT PRIMARY KEY,
 			type TEXT NOT NULL,
+			x INTEGER NOT NULL DEFAULT 0,
+			y INTEGER NOT NULL DEFAULT 0,
 			label TEXT DEFAULT '',
 			pty_id TEXT,
 			note_content TEXT,
@@ -910,6 +912,8 @@ func initDB() {
 
 	// Migration: add active column if not exists
 	db.Exec(`ALTER TABLE session_meta ADD COLUMN active INTEGER DEFAULT 0`)
+	db.Exec(`ALTER TABLE board_items ADD COLUMN x INTEGER NOT NULL DEFAULT 0`)
+	db.Exec(`ALTER TABLE board_items ADD COLUMN y INTEGER NOT NULL DEFAULT 0`)
 
 	// Projects indexer tables
 	_, err = db.Exec(`
@@ -953,6 +957,8 @@ func initDB() {
 type BoardItemRecord struct {
 	ID          string `json:"id"`
 	Type        string `json:"type"`
+	X           int    `json:"x"`
+	Y           int    `json:"y"`
 	Label       string `json:"label"`
 	PtyID       string `json:"ptyId,omitempty"`
 	NoteContent string `json:"noteContent,omitempty"`
@@ -967,7 +973,7 @@ type BoardLayoutRecord struct {
 
 func listBoardItems() ([]map[string]interface{}, error) {
 	rows, err := db.Query(`
-		SELECT id, type, label, pty_id, note_content, current_path
+		SELECT id, type, x, y, label, pty_id, note_content, current_path
 		FROM board_items
 		ORDER BY updated_at DESC, created_at DESC, id ASC
 	`)
@@ -979,16 +985,17 @@ func listBoardItems() ([]map[string]interface{}, error) {
 	items := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var id, itemType, label string
+		var x, y int
 		var ptyID, noteContent, currentPath sql.NullString
-		if err := rows.Scan(&id, &itemType, &label, &ptyID, &noteContent, &currentPath); err != nil {
+		if err := rows.Scan(&id, &itemType, &x, &y, &label, &ptyID, &noteContent, &currentPath); err != nil {
 			return nil, err
 		}
 
 		items = append(items, map[string]interface{}{
 			"id":          id,
 			"type":        itemType,
-			"x":           0,
-			"y":           0,
+			"x":           x,
+			"y":           y,
 			"label":       label,
 			"ptyId":       ptyID.String,
 			"noteContent": noteContent.String,
@@ -1010,16 +1017,18 @@ func upsertBoardItem(item BoardItemRecord) error {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := db.Exec(`
-		INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO board_items (id, type, x, y, label, pty_id, note_content, current_path, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			type = excluded.type,
+			x = excluded.x,
+			y = excluded.y,
 			label = excluded.label,
 			pty_id = excluded.pty_id,
 			note_content = excluded.note_content,
 			current_path = excluded.current_path,
 			updated_at = excluded.updated_at
-	`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now)
+	`, item.ID, item.Type, item.X, item.Y, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now)
 	return err
 }
 
@@ -1052,9 +1061,9 @@ func syncBoardItems(items []BoardItemRecord) error {
 			return fmt.Errorf("invalid board item")
 		}
 		if _, err := tx.Exec(`
-			INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now); err != nil {
+			INSERT INTO board_items (id, type, x, y, label, pty_id, note_content, current_path, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, item.ID, item.Type, item.X, item.Y, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now); err != nil {
 			return err
 		}
 	}
@@ -1557,6 +1566,7 @@ func killSession(sessionID string) {
 
 	// Mark as inactive in DB
 	deactivateSession(sessionID)
+	db.Exec("DELETE FROM board_items WHERE pty_id = ?", sessionID)
 }
 
 func deactivateSession(sessionID string) {
