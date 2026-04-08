@@ -784,6 +784,7 @@ Environment variables:
 
 	initDB()
 	restoreSessions()
+	cleanupStaleBoardItems()
 	initProjectsIndexer()
 	ensureMCPConfigured()
 	ensureHooksConfigured()
@@ -1649,6 +1650,42 @@ func restoreSessions() {
 
 	if restored > 0 {
 		log.Printf("Restored %d sessions", restored)
+	}
+}
+
+// cleanupStaleBoardItems removes terminal board_items whose pty_id
+// doesn't match any live session. Runs once at startup after restoreSessions.
+func cleanupStaleBoardItems() {
+	sessionsMu.RLock()
+	liveIDs := make(map[string]bool, len(sessions))
+	for id := range sessions {
+		liveIDs[id] = true
+	}
+	sessionsMu.RUnlock()
+
+	rows, err := db.Query(`SELECT id, pty_id FROM board_items WHERE type = 'terminal' AND pty_id != ''`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	var stale []string
+	for rows.Next() {
+		var id, ptyID string
+		if err := rows.Scan(&id, &ptyID); err != nil {
+			continue
+		}
+		if !liveIDs[ptyID] {
+			stale = append(stale, id)
+		}
+	}
+
+	for _, id := range stale {
+		db.Exec(`DELETE FROM board_items WHERE id = ?`, id)
+	}
+
+	if len(stale) > 0 {
+		log.Printf("Cleaned up %d stale board items", len(stale))
 	}
 }
 
