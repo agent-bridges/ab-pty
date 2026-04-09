@@ -981,12 +981,29 @@ func listBoardItems() ([]map[string]interface{}, error) {
 	}
 	defer rows.Close()
 
+	// Build set of live session IDs to filter stale terminals
+	sessionsMu.RLock()
+	liveIDs := make(map[string]bool, len(sessions))
+	for id := range sessions {
+		liveIDs[id] = true
+	}
+	sessionsMu.RUnlock()
+
 	items := make([]map[string]interface{}, 0)
+	var staleIDs []string
 	for rows.Next() {
 		var id, itemType, label string
 		var ptyID, noteContent, currentPath sql.NullString
 		if err := rows.Scan(&id, &itemType, &label, &ptyID, &noteContent, &currentPath); err != nil {
 			return nil, err
+		}
+
+		// Drop stale terminals — ptyId empty or session not alive
+		if itemType == "terminal" {
+			if ptyID.String == "" || !liveIDs[ptyID.String] {
+				staleIDs = append(staleIDs, id)
+				continue
+			}
 		}
 
 		items = append(items, map[string]interface{}{
@@ -997,6 +1014,11 @@ func listBoardItems() ([]map[string]interface{}, error) {
 			"noteContent": noteContent.String,
 			"currentPath": currentPath.String,
 		})
+	}
+
+	// Clean up stale records from DB
+	for _, id := range staleIDs {
+		db.Exec(`DELETE FROM board_items WHERE id = ?`, id)
 	}
 
 	return items, rows.Err()
