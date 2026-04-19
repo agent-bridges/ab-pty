@@ -228,7 +228,21 @@ func collectChildren(pid int, result *[]ProcessInfo, depth int) {
 var Version = "dev"
 
 // JWT authentication
-const jwtSecretFile = "/opt/agent-bridge/.jwt-secret"
+//
+// Canonical location: /opt/ab/.jwt-secret
+// Legacy locations (still read, with warning — remove after migration):
+//   /opt/agent-bridge/.jwt-secret  (v0.1.9+)
+//   /opt/nag-daemons/.jwt-secret   (pre-v0.1.9)
+const jwtSecretFileCanonical = "/opt/ab/.jwt-secret"
+
+var jwtSecretFileLegacy = []string{
+	"/opt/agent-bridge/.jwt-secret",
+	"/opt/nag-daemons/.jwt-secret",
+}
+
+// Reported as the canonical path in logs/errors — kept as a var for tests.
+var jwtSecretFile = jwtSecretFileCanonical
+
 const allowedOriginsEnv = "AB_PTY_ALLOWED_ORIGINS"
 
 type jwtSecretCache struct {
@@ -285,13 +299,25 @@ func (c *jwtSecretCache) get() string {
 		return c.secret
 	}
 
-	if data, err := os.ReadFile(jwtSecretFile); err == nil {
-		secret := strings.TrimSpace(string(data))
-		if len(secret) >= 32 {
-			c.secret = secret
-			c.lastLoad = time.Now()
-			log.Printf("JWT secret loaded from %s", jwtSecretFile)
+	// Try canonical path first, then each legacy path with a deprecation warning.
+	paths := append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
 		}
+		secret := strings.TrimSpace(string(data))
+		if len(secret) < 32 {
+			continue
+		}
+		c.secret = secret
+		c.lastLoad = time.Now()
+		if p == jwtSecretFileCanonical {
+			log.Printf("JWT secret loaded from %s", p)
+		} else {
+			log.Printf("WARN: JWT secret loaded from legacy path %s — migrate to %s", p, jwtSecretFileCanonical)
+		}
+		return c.secret
 	}
 	return c.secret
 }
@@ -345,10 +371,23 @@ func runGenJWT(args []string) {
 	fs := flag.NewFlagSet("genjwt", flag.ExitOnError)
 	fs.BoolVar(&genSecret, "gen-secret", false, "Generate new secret and save to .jwt-secret")
 	fs.StringVar(&expiry, "expiry", "1y", "Token expiry: 1y, 30d, 24h")
-	fs.StringVar(&secretDir, "dir", "/opt/agent-bridge", "Directory for .jwt-secret file")
+	fs.StringVar(&secretDir, "dir", "/opt/ab", "Directory for .jwt-secret file")
 	fs.Parse(args)
 
 	secretPath := filepath.Join(secretDir, ".jwt-secret")
+
+	// When reading (not generating), fall back to legacy paths with a warning.
+	if !genSecret {
+		if _, err := os.Stat(secretPath); os.IsNotExist(err) {
+			for _, legacy := range jwtSecretFileLegacy {
+				if _, lerr := os.Stat(legacy); lerr == nil {
+					fmt.Fprintf(os.Stderr, "WARN: reading secret from legacy path %s — migrate to %s\n", legacy, secretPath)
+					secretPath = legacy
+					break
+				}
+			}
+		}
+	}
 
 	if genSecret {
 		// Generate random 32-byte secret
@@ -733,7 +772,7 @@ Utilities:
 
 Environment variables:
   AB_PTY_PORT       Server port (default: 8421)
-  AB_PTY_DATABASE   SQLite database path (default: ../data/sessions.db)
+  AB_PTY_DATABASE   SQLite database path (default: /opt/ab/data/sessions.db)
 `, Version)
 			return
 		case "list":
@@ -850,14 +889,30 @@ Environment variables:
 }
 
 func initDB() {
-	// Database in ../data directory
-	execPath, _ := os.Executable()
-	dataDir := filepath.Join(filepath.Dir(execPath), "..", "data")
-	os.MkdirAll(dataDir, 0755)
+	// Canonical DB location: /opt/ab/data/sessions.db
+	// Env AB_PTY_DATABASE overrides (used by Docker: /state/pty/sessions.db).
+	// If neither the canonical dir nor env is set, fall back to legacy
+	// /opt/data/sessions.db (hz1-avito, test hosts) with a warning.
+	const canonicalDataDir = "/opt/ab/data"
 
 	dbPath := os.Getenv("AB_PTY_DATABASE")
 	if dbPath == "" {
-		dbPath = filepath.Join(dataDir, "sessions.db")
+		canonicalPath := filepath.Join(canonicalDataDir, "sessions.db")
+		legacyPath := "/opt/data/sessions.db"
+
+		if _, err := os.Stat(canonicalPath); err == nil {
+			dbPath = canonicalPath
+		} else if _, err := os.Stat(legacyPath); err == nil {
+			log.Printf("WARN: using legacy DB path %s — migrate to %s", legacyPath, canonicalPath)
+			dbPath = legacyPath
+		} else {
+			// First run: create canonical dir
+			os.MkdirAll(canonicalDataDir, 0755)
+			dbPath = canonicalPath
+		}
+	} else {
+		// Ensure the directory for the env-provided path exists
+		os.MkdirAll(filepath.Dir(dbPath), 0755)
 	}
 
 	var err error
@@ -1357,12 +1412,89 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	// Start cwd tracker goroutine
 	go trackCwd(session)
 
+	// Track running AI child process (claude/codex/aider) so we can re-launch
+	// it after a daemon restart.
+	go trackAICmd(session)
+
 	// Start claude session tracker for non-shell sessions without explicit session ID
 	if !shellOnly && continueSession == "" {
 		go trackClaudeSession(session)
 	}
 
 	return session, nil
+}
+
+// remapClaudeToWrapper rewrites a `claude …` cmdline to the `claudes` wrapper
+// and drops any `--dangerously-skip-permissions` flag (the wrapper adds it).
+func remapClaudeToWrapper(cmdline string) string {
+	parts := strings.Fields(cmdline)
+	if len(parts) == 0 {
+		return cmdline
+	}
+	// Replace the claude binary with the wrapper
+	parts[0] = "claudes"
+	// Drop --dangerously-skip-permissions (the wrapper always passes it)
+	filtered := parts[:0]
+	for _, a := range parts {
+		if a == "--dangerously-skip-permissions" {
+			continue
+		}
+		filtered = append(filtered, a)
+	}
+	return strings.Join(filtered, " ")
+}
+
+// trackAICmd periodically inspects child processes of the session's shell and
+// records the command line of any running AI agent (claude/codex/aider/cursor)
+// into session_meta.last_ai_cmd. On daemon restart, restoreSessions feeds this
+// command back into the new shell so the agent resumes.
+func trackAICmd(session *Session) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		if !session.Alive {
+			return
+		}
+		if session.Cmd == nil || session.Cmd.Process == nil {
+			continue
+		}
+
+		procs := getChildProcesses(session.Cmd.Process.Pid)
+		aiCmd := ""
+		for _, p := range procs {
+			switch p.Cmd {
+			case "claude":
+				// Raw `claude` refuses to run as root with --dangerously-skip-permissions.
+				// Remap to the `claudes` wrapper (IS_SANDBOX=1 claude --dangerously-skip-permissions "$@"),
+				// which handles both; strip the flag to avoid duplication.
+				aiCmd = remapClaudeToWrapper(p.Args)
+			case "codex", "aider", "cursor":
+				aiCmd = p.Args
+			case "node", "npm", "npx":
+				if hasCodexLikeArgs(p.Args) {
+					aiCmd = p.Args
+				}
+			}
+			if aiCmd != "" {
+				break
+			}
+		}
+
+		existing := getSessionMeta(session.ID)
+		var prev string
+		if existing != nil && existing.Meta != nil {
+			if s, ok := existing.Meta["last_ai_cmd"].(string); ok {
+				prev = s
+			}
+		}
+
+		if aiCmd != prev {
+			setSessionMeta(session.ID, nil, nil, map[string]interface{}{
+				"last_ai_cmd": aiCmd,
+			})
+		}
+	}
 }
 
 // trackCwd periodically reads the current working directory of the PTY process
@@ -1657,6 +1789,16 @@ func restoreSessions() {
 		if session != nil {
 			restored++
 			log.Printf("Restored session %s (shell=%v, path=%s)", id, shellOnly, startPath)
+
+			// If an AI command (claude/codex/aider) was running in this session
+			// before the restart, re-launch it by feeding the command into the
+			// new shell's stdin. Only applies to shell sessions — claude-only
+			// sessions are already resumed via --resume above.
+			if shellOnly {
+				if aiCmd, ok := meta["last_ai_cmd"].(string); ok && aiCmd != "" {
+					go relaunchAICmd(session, aiCmd)
+				}
+			}
 		} else if err != nil {
 			log.Printf("Failed to restore session %s: %v", id, err)
 		}
@@ -1665,6 +1807,21 @@ func restoreSessions() {
 	if restored > 0 {
 		log.Printf("Restored %d sessions", restored)
 	}
+}
+
+// relaunchAICmd writes an AI command into a freshly-restored shell session so
+// the previously-running agent (claude/codex/…) starts back up. Waits briefly
+// for the login shell to reach its prompt before writing.
+func relaunchAICmd(session *Session, aiCmd string) {
+	time.Sleep(2 * time.Second)
+	if !session.Alive || session.Pty == nil {
+		return
+	}
+	if _, err := session.Pty.Write([]byte(aiCmd + "\n")); err != nil {
+		log.Printf("Failed to relaunch AI cmd in %s: %v", session.ID, err)
+		return
+	}
+	log.Printf("Re-launched AI cmd in %s: %s", session.ID, aiCmd)
 }
 
 // cleanupStaleBoardItems removes terminal board_items whose pty_id
