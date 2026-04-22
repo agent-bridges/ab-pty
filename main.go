@@ -559,12 +559,21 @@ func parseExpiry(s string) time.Duration {
 
 // CLI helper: get local JWT token
 func getLocalJWT() string {
-	data, err := os.ReadFile(jwtSecretFile)
-	if err != nil {
-		return ""
+	// Try canonical path first, then the same legacy paths the daemon reads.
+	paths := append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
+	var secret string
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := strings.TrimSpace(string(data))
+		if len(s) >= 32 {
+			secret = s
+			break
+		}
 	}
-	secret := strings.TrimSpace(string(data))
-	if len(secret) < 32 {
+	if secret == "" {
 		return ""
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -813,21 +822,29 @@ func runKillSession(target string) {
 // --- In-session client CLI ------------------------------------------------
 
 func clientHelp() {
-	fmt.Print(`ab-pty client — full UI-parity API client (for use inside a PTY session)
+	fmt.Print(`ab — full UI-parity API client (for use inside a PTY session)
 
 Authenticates via $AB_PTY_SESSION_TOKEN (injected by the daemon into every
 session). Target defaults to http://127.0.0.1:${AB_PTY_PORT:-8421}.
 
 Usage:
-  ab-pty client sessions list
-  ab-pty client sessions get    <pty_id>
-  ab-pty client sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
-  ab-pty client sessions kill   <pty_id>
-  ab-pty client sessions write  <pty_id> "text" [--no-enter]     # alias: send
-  ab-pty client sessions tail   <pty_id> [--lines N]             # alias: peek
-  ab-pty client sessions meta   <pty_id> [--label L] [--set k=v ...]
-  ab-pty client sessions lock   <pty_id>
-  ab-pty client sessions unlock <pty_id>
+  ab sessions list
+  ab sessions get    <pty_id>
+  ab sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
+  ab sessions kill   <pty_id>
+  ab sessions write  <pty_id> "text" [--no-enter]     # alias: send
+  ab sessions tail   <pty_id> [--lines N]             # alias: peek
+  ab sessions meta   <pty_id> [--label L] [--set k=v ...]
+  ab sessions lock   <pty_id>
+  ab sessions unlock <pty_id>
+
+Examples (inside a PTY session, with $AB_PTY_SESSION_TOKEN preset):
+  ab sessions list
+  ab sessions write pty_123 "please write the login form"
+  ab sessions tail  pty_123 --lines 40
+
+Note: the 'ab' command is a wrapper for 'ab-pty client'. If the wrapper
+isn't installed, run 'ab-pty client sessions list' directly.
 `)
 }
 
@@ -1097,6 +1114,7 @@ Environment variables:
 	initProjectsIndexer()
 	ensureMCPConfigured()
 	ensureHooksConfigured()
+	ensureAbSkillInstalled()
 
 	// Public endpoints (no auth)
 	http.HandleFunc("/info", handleInfo)
@@ -4245,6 +4263,107 @@ func mcpToolResult(id interface{}, text string) string {
 			},
 		},
 	})
+}
+
+// abSkillBody is the content installed into Claude Code skills and
+// Codex AGENTS.md so both agents, running inside a PTY session, know how
+// to use the in-session `ab` CLI when the user asks in natural language.
+// The header comment lets ensureAbSkillInstalled() detect our own file
+// and refresh it across daemon versions without overwriting user edits.
+const abSkillMarkerV1 = "<!-- ab-skill v1 generated-by=ab-pty -->"
+
+const abSkillBody = `<!-- ab-skill v1 generated-by=ab-pty -->
+---
+name: ab-pty-multi-agent
+description: Use when the user asks to create, list, send to, tail, or kill PTY sessions in AB (multi-agent orchestration on this host). Triggers on phrases like "create ab session", "list sessions", "send to <name>", "tail <name>", "kill session <name>".
+---
+
+# AB PTY sessions
+
+You are running inside an AB PTY session. A local CLI ` + "`ab`" + ` is available on
+PATH and authenticated automatically via ` + "`$AB_PTY_SESSION_TOKEN`" + ` (injected
+into this session's env by the PTY daemon). No auth flags needed.
+
+Use ` + "`ab`" + ` to orchestrate sibling sessions on THIS host.
+
+## Subcommands
+
+- ` + "`ab sessions list`" + ` — JSON array of all sessions on this daemon.
+- ` + "`ab sessions get <pty_id>`" + ` — JSON details for one session.
+- ` + "`ab sessions create -shell -project <cwd> -name <name>`" + ` — create a shell session.
+- ` + "`ab sessions write <pty_id> \"<text>\"`" + ` — inject text into a session's stdin (a trailing Enter is added unless ` + "`--no-enter`" + ` is passed).
+- ` + "`ab sessions tail  <pty_id> --lines 50`" + ` — read recent scrollback as JSON.
+- ` + "`ab sessions kill  <pty_id>`" + ` — terminate a session.
+- ` + "`ab sessions meta  <pty_id> --label <L> [--set k=v ...]`" + ` — rename or set custom meta.
+- ` + "`ab sessions lock <pty_id>`" + ` / ` + "`ab sessions unlock <pty_id>`" + `.
+
+## Resolving names → pty_id
+
+The user will reference sessions by their human name (e.g. "dev1", "test"),
+but all write/tail/kill commands need the opaque ` + "`pty_XXX`" + ` id. Always resolve
+via list first:
+
+` + "```" + `
+ab sessions list | jq -r '.[] | select(.name=="dev1") | .id'
+` + "```" + `
+
+If ` + "`jq`" + ` isn't available, grep the JSON and extract the ` + "`id`" + ` field.
+
+## Natural-language examples
+
+| User says                                  | You run                                                       |
+| ------------------------------------------ | ------------------------------------------------------------- |
+| "create ab session test"                   | ` + "`ab sessions create -shell -project /tmp -name test`" + `  |
+| "list sessions"                            | ` + "`ab sessions list`" + `                                  |
+| "send to dev1: please build the login form" | resolve dev1 → ` + "`ab sessions write <id> \"please build the login form\"`" + ` |
+| "tail dev1 last 40 lines"                  | resolve dev1 → ` + "`ab sessions tail <id> --lines 40`" + ` |
+| "kill test session"                        | resolve test → ` + "`ab sessions kill <id>`" + `              |
+| "rename session <id> to dev2"              | ` + "`ab sessions meta <id> --label dev2`" + `                |
+
+## Notes
+
+- ` + "`ab`" + ` only reaches sessions on the SAME PTY daemon as yours (v1). To send to
+  a session on a different host, ask the user to configure cross-daemon peering.
+- ` + "`ab sessions write`" + ` appends Enter by default — the receiving session sees
+  exactly what a human would see after typing + pressing Return.
+- The session token is bound to YOUR session's lifetime. If your session ends,
+  the token stops working.
+`
+
+// ensureAbSkillInstalled writes the ab-pty skill into the daemon user's
+// ~/.claude/skills/ab/SKILL.md and ~/.codex/AGENTS.md if not present, or
+// refreshes them if they carry our v1 marker. User-authored files (no
+// marker) are left untouched so local customisations survive upgrades.
+func ensureAbSkillInstalled() {
+	usr, err := user.Current()
+	if err != nil || usr.HomeDir == "" {
+		return
+	}
+	targets := []string{
+		filepath.Join(usr.HomeDir, ".claude", "skills", "ab", "SKILL.md"),
+		filepath.Join(usr.HomeDir, ".codex", "AGENTS.md"),
+	}
+	for _, p := range targets {
+		shouldWrite := true
+		if existing, err := os.ReadFile(p); err == nil {
+			if !strings.Contains(string(existing), abSkillMarkerV1) {
+				// User-authored, keep as is.
+				shouldWrite = false
+			}
+		}
+		if !shouldWrite {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			log.Printf("ab skill: failed to mkdir %s: %v", filepath.Dir(p), err)
+			continue
+		}
+		if err := os.WriteFile(p, []byte(abSkillBody), 0644); err != nil {
+			log.Printf("ab skill: failed to write %s: %v", p, err)
+			continue
+		}
+		log.Printf("Installed ab skill: %s", p)
+	}
 }
 
 // ensureMCPConfigured quietly ensures MCP is configured on startup
