@@ -3,7 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -360,6 +363,105 @@ func jwtMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// deriveSessionToken mints the in-session bearer token for a given sessionID.
+// Format: "sess.<session_id>.<hex(HMAC_SHA256(jwtSecret, "session:"+session_id))>"
+// The token is injected into the PTY's env as AB_PTY_SESSION_TOKEN so the agent
+// running inside the session can call /api/pty/* endpoints on 127.0.0.1.
+func deriveSessionToken(sessionID string) string {
+	secret := jwtCache.get()
+	if secret == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte("session:" + sessionID))
+	return "sess." + sessionID + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// validateSessionToken verifies a "sess.<id>.<hex>" token and returns the
+// session id on success. The caller's session must be alive.
+func validateSessionToken(token string) (string, bool) {
+	if !strings.HasPrefix(token, "sess.") {
+		return "", false
+	}
+	rest := token[len("sess."):]
+	// sessionID may contain dots in legacy data; split on the LAST dot so hmac
+	// (hex, no dots) is always the suffix.
+	idx := strings.LastIndex(rest, ".")
+	if idx < 0 {
+		return "", false
+	}
+	sessionID := rest[:idx]
+	presented := rest[idx+1:]
+
+	secret := jwtCache.get()
+	if secret == "" {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte("session:" + sessionID))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) != 1 {
+		return "", false
+	}
+
+	sessionsMu.RLock()
+	s, ok := sessions[sessionID]
+	sessionsMu.RUnlock()
+	if !ok || !s.Alive {
+		return "", false
+	}
+	return sessionID, true
+}
+
+// sessionTokenOrJwt accepts either the existing daemon JWT or an in-session
+// bearer token minted by deriveSessionToken. Session-token holders get the
+// same privileges as JWT holders in v1 — this matches the "the agent inside
+// a PTY can do what the AB UI user can do" spec.
+func sessionTokenOrJwt(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		secret := jwtCache.get()
+		if secret == "" {
+			http.Error(w, "jwt secret is not configured", http.StatusServiceUnavailable)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "missing authorization", http.StatusUnauthorized)
+			return
+		}
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			http.Error(w, "invalid authorization format", http.StatusUnauthorized)
+			return
+		}
+		presented := parts[1]
+
+		// Session-token path
+		if strings.HasPrefix(presented, "sess.") {
+			if _, ok := validateSessionToken(presented); ok {
+				next(w, r)
+				return
+			}
+			http.Error(w, "invalid or expired session token", http.StatusUnauthorized)
+			return
+		}
+
+		// JWT path (unchanged behaviour)
+		token, err := jwt.Parse(presented, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return []byte(secret), nil
+		})
+		if err != nil || !token.Valid {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
 // runGenJWT handles the genjwt subcommand
 func runGenJWT(args []string) {
 	var (
@@ -493,7 +595,12 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	if token := getLocalJWT(); token != "" {
+	// Prefer an in-session bearer token (set when running INSIDE a PTY the daemon
+	// spawned). Falls back to minting a short-lived admin JWT from the daemon
+	// secret on disk (when run ON the daemon host, e.g. from cron or sysadmin shell).
+	if tok := os.Getenv("AB_PTY_SESSION_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	} else if token := getLocalJWT(); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -703,6 +810,160 @@ func runKillSession(target string) {
 	}
 }
 
+// --- In-session client CLI ------------------------------------------------
+
+func clientHelp() {
+	fmt.Print(`ab-pty client — full UI-parity API client (for use inside a PTY session)
+
+Authenticates via $AB_PTY_SESSION_TOKEN (injected by the daemon into every
+session). Target defaults to http://127.0.0.1:${AB_PTY_PORT:-8421}.
+
+Usage:
+  ab-pty client sessions list
+  ab-pty client sessions get    <pty_id>
+  ab-pty client sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
+  ab-pty client sessions kill   <pty_id>
+  ab-pty client sessions write  <pty_id> "text" [--no-enter]     # alias: send
+  ab-pty client sessions tail   <pty_id> [--lines N]             # alias: peek
+  ab-pty client sessions meta   <pty_id> [--label L] [--set k=v ...]
+  ab-pty client sessions lock   <pty_id>
+  ab-pty client sessions unlock <pty_id>
+`)
+}
+
+func runClient(args []string) {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+		clientHelp()
+		return
+	}
+	switch args[0] {
+	case "sessions":
+		runClientSessions(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown client subcommand: %s\n", args[0])
+		clientHelp()
+		os.Exit(2)
+	}
+}
+
+func runClientSessions(args []string) {
+	if len(args) == 0 {
+		clientHelp()
+		os.Exit(2)
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "list":
+		out, err := cliRequest("GET", "/api/pty", nil)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "get":
+		requireArg(rest, 0, "get", "<pty_id>")
+		out, err := cliRequest("GET", "/api/pty/"+rest[0], nil)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "create":
+		// Delegate to existing runCreateSession's HTTP body builder — but we
+		// want the CLI flags for `client sessions create` consistent with the
+		// top-level `create` command. Easier: just reuse runCreateSession.
+		runCreateSession(rest)
+	case "kill":
+		requireArg(rest, 0, "kill", "<pty_id>")
+		_, err := cliRequest("DELETE", "/api/pty/"+rest[0], nil)
+		requireOK(err)
+		fmt.Println(`{"ok":true}`)
+	case "write", "send":
+		requireArg(rest, 1, sub, "<pty_id> <text>")
+		target := rest[0]
+		text := rest[1]
+		enter := true
+		for _, a := range rest[2:] {
+			if a == "--no-enter" {
+				enter = false
+			}
+		}
+		body, _ := json.Marshal(map[string]interface{}{"text": text, "enter": enter})
+		out, err := cliRequest("POST", "/api/pty/"+target+"/stdin", body)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "tail", "peek":
+		requireArg(rest, 0, sub, "<pty_id> [--lines N]")
+		target := rest[0]
+		lines := 50
+		for i := 1; i < len(rest); i++ {
+			if rest[i] == "--lines" && i+1 < len(rest) {
+				if n, err := strconv.Atoi(rest[i+1]); err == nil && n > 0 {
+					lines = n
+				}
+				i++
+			}
+		}
+		out, err := cliRequest("GET", fmt.Sprintf("/api/pty/%s/scrollback?lines=%d", target, lines), nil)
+		requireOK(err)
+		// Pretty-print lines one per row if the caller asked for --raw? v1: just
+		// print the JSON so it stays machine-parseable.
+		fmt.Println(string(out))
+	case "meta":
+		requireArg(rest, 0, "meta", "<pty_id> [--label L] [--set k=v ...]")
+		target := rest[0]
+		payload := map[string]interface{}{}
+		metaSet := map[string]interface{}{}
+		for i := 1; i < len(rest); i++ {
+			switch rest[i] {
+			case "--label":
+				if i+1 < len(rest) {
+					payload["label"] = rest[i+1]
+					i++
+				}
+			case "--set":
+				if i+1 < len(rest) {
+					kv := strings.SplitN(rest[i+1], "=", 2)
+					if len(kv) == 2 {
+						metaSet[kv[0]] = kv[1]
+					}
+					i++
+				}
+			}
+		}
+		if len(metaSet) > 0 {
+			payload["meta"] = metaSet
+		}
+		body, _ := json.Marshal(payload)
+		out, err := cliRequest("PATCH", "/api/pty/"+target+"/meta", body)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "lock":
+		requireArg(rest, 0, "lock", "<pty_id>")
+		out, err := cliRequest("POST", "/api/pty/"+rest[0]+"/lock", nil)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "unlock":
+		requireArg(rest, 0, "unlock", "<pty_id>")
+		out, err := cliRequest("DELETE", "/api/pty/"+rest[0]+"/lock", nil)
+		requireOK(err)
+		fmt.Println(string(out))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown sessions subcommand: %s\n", sub)
+		clientHelp()
+		os.Exit(2)
+	}
+}
+
+func requireArg(args []string, idx int, cmd, usage string) {
+	if len(args) <= idx {
+		fmt.Fprintf(os.Stderr, "Usage: ab-pty client sessions %s %s\n", cmd, usage)
+		os.Exit(2)
+	}
+}
+
+func requireOK(err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // Projects indexer
 var (
 	claudeProjectsDir string
@@ -763,6 +1024,10 @@ Session management (no JWT needed):
   create      Create new PTY session (use -h for options)
   kill <id>   Kill session by ID or name (kills all matching names)
 
+In-session API client (for use INSIDE a PTY session — auth from env):
+  client      Full UI-parity CLI: sessions list/get/create/kill/write/tail/meta/lock
+              Run 'ab-pty client -h' for subcommands.
+
 Utilities:
   version     Show version
   genjwt      Generate JWT token (use -h for options)
@@ -771,8 +1036,10 @@ Utilities:
   help        Show this help
 
 Environment variables:
-  AB_PTY_PORT       Server port (default: 8421)
-  AB_PTY_DATABASE   SQLite database path (default: /opt/ab/data/sessions.db)
+  AB_PTY_PORT            Server port (default: 8421)
+  AB_PTY_DATABASE        SQLite database path (default: /opt/ab/data/sessions.db)
+  AB_PTY_SESSION_ID      (set by daemon in each PTY) caller session id
+  AB_PTY_SESSION_TOKEN   (set by daemon in each PTY) bearer for /api/pty/* calls
 `, Version)
 			return
 		case "list":
@@ -799,6 +1066,9 @@ Environment variables:
 			return
 		case "setup-mcp":
 			setupMCPConfig()
+			return
+		case "client":
+			runClient(os.Args[2:])
 			return
 		}
 	}
@@ -832,23 +1102,24 @@ Environment variables:
 	http.HandleFunc("/info", handleInfo)
 	http.HandleFunc("/health", handleHealth)
 
-	// Protected endpoints (require JWT if secret configured)
-	http.HandleFunc("/api/pty", jwtMiddleware(handleListPty))
-	http.HandleFunc("/api/pty/", jwtMiddleware(handlePtyAPI))
-	http.HandleFunc("/api/board/items", jwtMiddleware(handleBoardItems))
-	http.HandleFunc("/api/board/items/", jwtMiddleware(handleBoardItems))
-	http.HandleFunc("/api/board/layouts", jwtMiddleware(handleBoardLayouts))
-	http.HandleFunc("/api/board/layouts/", jwtMiddleware(handleBoardLayouts))
-	http.HandleFunc("/api/projects", jwtMiddleware(handleListProjects))
-	http.HandleFunc("/api/projects/", jwtMiddleware(handleProjectsAPI))
-	http.HandleFunc("/api/sessions/", jwtMiddleware(handleSessionsAPI))
-	http.HandleFunc("/api/fs", jwtMiddleware(handleFS))
-	http.HandleFunc("/api/mkdir", jwtMiddleware(handleMkdir))
-	http.HandleFunc("/api/fs/download", jwtMiddleware(handleFSDownload))
-	http.HandleFunc("/api/fs/upload", jwtMiddleware(handleFSUpload))
-	http.HandleFunc("/api/paste-image", jwtMiddleware(handlePasteImage))
-	http.HandleFunc("/ws", jwtMiddleware(handleWebSocket))
-	http.HandleFunc("/ws/pty-state", jwtMiddleware(handlePtyState))
+	// Protected endpoints — accept either the daemon JWT (AB UI, admin CLI)
+	// or an in-session bearer token injected into PTY env (agent-to-daemon).
+	http.HandleFunc("/api/pty", sessionTokenOrJwt(handleListPty))
+	http.HandleFunc("/api/pty/", sessionTokenOrJwt(handlePtyAPI))
+	http.HandleFunc("/api/board/items", sessionTokenOrJwt(handleBoardItems))
+	http.HandleFunc("/api/board/items/", sessionTokenOrJwt(handleBoardItems))
+	http.HandleFunc("/api/board/layouts", sessionTokenOrJwt(handleBoardLayouts))
+	http.HandleFunc("/api/board/layouts/", sessionTokenOrJwt(handleBoardLayouts))
+	http.HandleFunc("/api/projects", sessionTokenOrJwt(handleListProjects))
+	http.HandleFunc("/api/projects/", sessionTokenOrJwt(handleProjectsAPI))
+	http.HandleFunc("/api/sessions/", sessionTokenOrJwt(handleSessionsAPI))
+	http.HandleFunc("/api/fs", sessionTokenOrJwt(handleFS))
+	http.HandleFunc("/api/mkdir", sessionTokenOrJwt(handleMkdir))
+	http.HandleFunc("/api/fs/download", sessionTokenOrJwt(handleFSDownload))
+	http.HandleFunc("/api/fs/upload", sessionTokenOrJwt(handleFSUpload))
+	http.HandleFunc("/api/paste-image", sessionTokenOrJwt(handlePasteImage))
+	http.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
+	http.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
 
 	// Hook endpoint — called by Claude Code hooks from inside PTY sessions (no JWT needed)
 	http.HandleFunc("/api/hook", handleHook)
@@ -1357,6 +1628,21 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 			"LANG=en_US.UTF-8",
 			"LC_ALL=en_US.UTF-8",
 		)
+	}
+
+	// In-session API — the agent running inside the PTY can use these to
+	// call /api/pty/* endpoints on 127.0.0.1 (or via the `ab-pty client` CLI).
+	// Token is derived from the daemon JWT secret + session id (HMAC) and is
+	// only valid while the session is alive.
+	if tok := deriveSessionToken(sessionID); tok != "" {
+		cmd.Env = append(cmd.Env,
+			"AB_PTY_SESSION_ID="+sessionID,
+			"AB_PTY_SESSION_TOKEN="+tok,
+		)
+	}
+	// Expose the daemon's listening port so the CLI default target is correct.
+	if port := os.Getenv("AB_PTY_PORT"); port != "" {
+		cmd.Env = append(cmd.Env, "AB_PTY_PORT="+port)
 	}
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
@@ -2917,6 +3203,71 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 
 		meta := setSessionMeta(sessionID, label, nil, metaUpdate)
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "label": meta.Label, "meta": meta.Meta})
+
+	case action == "stdin" && r.Method == "POST":
+		// Write raw text into a session's PTY master. Used by the in-session
+		// `ab-pty client sessions write` CLI to inject prompts into peer agents.
+		sessionsMu.RLock()
+		s, exists := sessions[sessionID]
+		sessionsMu.RUnlock()
+		if !exists {
+			writeError(w, 404, "Session not found")
+			return
+		}
+		if !s.Alive {
+			writeError(w, 409, "Session is not alive")
+			return
+		}
+		var body struct {
+			Text  string `json:"text"`
+			Enter *bool  `json:"enter,omitempty"` // default true
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, 400, "Invalid JSON body")
+			return
+		}
+		payload := body.Text
+		enter := true
+		if body.Enter != nil {
+			enter = *body.Enter
+		}
+		if enter && !strings.HasSuffix(payload, "\n") {
+			payload += "\n"
+		}
+		if _, err := s.Pty.Write([]byte(payload)); err != nil {
+			writeError(w, 500, fmt.Sprintf("Write failed: %v", err))
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "bytes": len(payload)})
+
+	case action == "scrollback" && r.Method == "GET":
+		// Return recent scrollback as plain text. Used by `ab-pty client sessions tail`.
+		sessionsMu.RLock()
+		s, exists := sessions[sessionID]
+		sessionsMu.RUnlock()
+		if !exists {
+			writeError(w, 404, "Session not found")
+			return
+		}
+		lines := 200
+		if q := r.URL.Query().Get("lines"); q != "" {
+			if n, err := strconv.Atoi(q); err == nil && n > 0 {
+				lines = n
+			}
+		}
+		s.mu.RLock()
+		total := len(s.Scrollback)
+		start := 0
+		if total > lines {
+			start = total - lines
+		}
+		slice := append([]string{}, s.Scrollback[start:]...)
+		s.mu.RUnlock()
+		writeJSON(w, 0, map[string]interface{}{
+			"ok":    true,
+			"lines": slice,
+			"total": total,
+		})
 
 	case action == "" && r.Method == "DELETE":
 		sessionsMu.RLock()
