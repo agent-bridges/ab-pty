@@ -832,17 +832,27 @@ Usage:
   ab sessions get    <pty_id>
   ab sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
   ab sessions kill   <pty_id>
-  ab sessions write  <pty_id> "text" [--no-enter]     # alias: send — auto-adds \r
+  ab sessions send   <pty_id> "text"                  # write + auto-submit (appends Enter)
+  ab sessions write  <pty_id> "text"                  # write only, DO NOT submit — user confirms
   ab sessions key    <pty_id> <key>                   # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
   ab sessions tail   <pty_id> [--lines N]             # alias: peek
   ab sessions meta   <pty_id> [--label L] [--set k=v ...]
   ab sessions lock   <pty_id>
   ab sessions unlock <pty_id>
 
+Behaviour of send vs write:
+  send  — you want the peer agent to ACT on the text immediately (fire off a task).
+  write — you want the peer's input buffer PRE-FILLED but leave the human / the
+          next call in control of when to submit. User can edit before pressing
+          Enter. To submit later: 'ab sessions key <id> enter'.
+
+Either command accepts explicit --enter / --no-enter to override the default.
+
 Examples (inside a PTY session, with $AB_PTY_SESSION_TOKEN preset):
   ab sessions list
-  ab sessions write pty_123 "please write the login form"
-  ab sessions key   pty_123 enter                     # explicit Enter keypress
+  ab sessions send  pty_123 "please write the login form"   # auto-submit
+  ab sessions write pty_123 "/refactor-component Button"    # draft; user edits & presses Enter
+  ab sessions key   pty_123 enter                           # explicit Enter keypress
   ab sessions tail  pty_123 --lines 40
 
 Note: the 'ab' command is a wrapper for 'ab-pty client'. If the wrapper
@@ -896,10 +906,18 @@ func runClientSessions(args []string) {
 		requireArg(rest, 1, sub, "<pty_id> <text>")
 		target := rest[0]
 		text := rest[1]
-		enter := true
+		// Different defaults:
+		//   send  — auto-submit (append Enter). Use "fire-off task" semantics.
+		//   write — NO submit. Peer sees text in input box; human/agent
+		//           decides when to press Enter. Use "draft" semantics.
+		// --enter / --no-enter override the default either way.
+		enter := sub == "send"
 		for _, a := range rest[2:] {
-			if a == "--no-enter" {
+			switch a {
+			case "--no-enter":
 				enter = false
+			case "--enter":
+				enter = true
 			}
 		}
 		body, _ := json.Marshal(map[string]interface{}{"text": text, "enter": enter})
@@ -4381,8 +4399,9 @@ Use ` + "`ab`" + ` to orchestrate sibling sessions on THIS host.
 - ` + "`ab sessions list`" + ` — JSON array of all sessions on this daemon.
 - ` + "`ab sessions get <pty_id>`" + ` — JSON details for one session.
 - ` + "`ab sessions create -shell -project <cwd> -name <name>`" + ` — create a shell session.
-- ` + "`ab sessions write <pty_id> \"<text>\"`" + ` — inject text into a session's stdin. A trailing Enter (CR, ` + "`\\r`" + `) is appended automatically unless ` + "`--no-enter`" + ` is passed. Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
-- ` + "`ab sessions key <pty_id> <key>`" + ` — send an explicit key press. Supported: ` + "`enter`" + `, ` + "`tab`" + `, ` + "`esc`" + `, ` + "`backspace`" + `, ` + "`up`" + `, ` + "`down`" + `, ` + "`left`" + `, ` + "`right`" + `, ` + "`home`" + `, ` + "`end`" + `, ` + "`pageup`" + `, ` + "`pagedown`" + `, ` + "`ctrl-c`" + `, ` + "`ctrl-d`" + `, ` + "`ctrl-z`" + `, ` + "`ctrl-l`" + `, ` + "`ctrl-u`" + `, ` + "`ctrl-w`" + `. Use this when ` + "`write`" + ` isn't the right fit (e.g. interrupting a running command, navigating a TUI menu, sending a second Enter on its own).
+- ` + "`ab sessions send  <pty_id> \"<text>\"`" + ` — write text AND press Enter. Auto-submits. Use when the user wants the peer agent to act on the text IMMEDIATELY ("tell dev1 to …", "ask dev2 for …"). Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
+- ` + "`ab sessions write <pty_id> \"<text>\"`" + ` — write text ONLY, no Enter. The peer's input box is pre-filled; a human (or another explicit call) decides when to submit / edit the text. Use when the user wants to "draft" or "prefill" a message ("prepare a task for dev1 but let me review before sending").
+- ` + "`ab sessions key <pty_id> <key>`" + ` — send an explicit key press. Supported: ` + "`enter`" + `, ` + "`tab`" + `, ` + "`esc`" + `, ` + "`backspace`" + `, ` + "`up`" + `, ` + "`down`" + `, ` + "`left`" + `, ` + "`right`" + `, ` + "`home`" + `, ` + "`end`" + `, ` + "`pageup`" + `, ` + "`pagedown`" + `, ` + "`ctrl-c`" + `, ` + "`ctrl-d`" + `, ` + "`ctrl-z`" + `, ` + "`ctrl-l`" + `, ` + "`ctrl-u`" + `, ` + "`ctrl-w`" + `. Use to interrupt a running command (` + "`ctrl-c`" + `), navigate a TUI menu (arrows + ` + "`enter`" + `), or submit a previously-drafted ` + "`write`" + ` (` + "`enter`" + `).
 - ` + "`ab sessions tail  <pty_id> --lines 50`" + ` — read recent scrollback as JSON.
 - ` + "`ab sessions kill  <pty_id>`" + ` — terminate a session.
 - ` + "`ab sessions meta  <pty_id> --label <L> [--set k=v ...]`" + ` — set the **display label** (what the user sees on the canvas).
@@ -4419,10 +4438,21 @@ If ` + "`jq`" + ` isn't available, grep the JSON and extract the ` + "`id`" + ` 
 | "create ab session test"                   | ` + "`ab sessions create -shell -project /tmp -name test`" + ` → grab id → ` + "`ab sessions meta <id> --label test`" + ` |
 | "create sessions s1, s2, s3"               | loop each name: create + meta --label                                                           |
 | "list sessions"                            | ` + "`ab sessions list`" + `                                                                     |
-| "send to dev1: please build the login form" | resolve dev1 by label → ` + "`ab sessions write <id> \"please build the login form\"`" + `      |
+| "send to dev1: please build the login form" (fire off) | resolve dev1 → ` + "`ab sessions send  <id> \"please build the login form\"`" + `   |
+| "draft for dev1: …" / "prefill dev1's input" | resolve dev1 → ` + "`ab sessions write <id> \"...\"`" + ` (user reviews & presses Enter)        |
+| "tell dev1 to stop" / "cancel dev1"        | resolve dev1 → ` + "`ab sessions key  <id> ctrl-c`" + `                                        |
 | "tail dev1 last 40 lines"                  | resolve dev1 → ` + "`ab sessions tail <id> --lines 40`" + `                                   |
 | "kill test session"                        | resolve test → ` + "`ab sessions kill <id>`" + `                                                |
 | "rename session <id> to dev2"              | ` + "`ab sessions meta <id> --label dev2`" + `                                                  |
+
+## send vs write — pick the right one
+
+The user's intent matters:
+
+- **send** = fire-off. The peer agent starts working on the text right now. Use for phrases like "send to dev1 …", "tell dev2 to …", "ask dev1 …", "have dev2 do …".
+- **write** = draft / prefill. Peer sees text in the input box but nothing happens until a human presses Enter (or you run ` + "`ab sessions key <id> enter`" + ` later). Use for phrases like "draft a task for dev1 …", "prefill …", "prepare a message but let me review …".
+
+Default to **send** if unsure — it matches the natural reading of "send to X" and "tell X".
 
 ## Notes
 
