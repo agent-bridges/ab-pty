@@ -4398,11 +4398,13 @@ Use ` + "`ab`" + ` to orchestrate sibling sessions on THIS host.
 
 - **list sessions** — show all peer sessions
 - **create session <name>** — spawn a new session labelled ` + "`<name>`" + `
-- **send to <name>: <message>** — write + auto-submit into peer (fire-off)
-- **write to <name>: <message>** — prefill peer's input, let user press Enter
+- **send to <name>: <message>** — fire a message at the peer and auto-submit it (this is the default for "send", "tell", "ask", "forward", "message", and any other verb that means the peer should ACT on the text)
+- **write draft to <name>: <message>** — (rare) prefill the peer's input without submitting. Use ONLY when the user explicitly says "draft", "prefill", "prepare without sending", "don't press enter yet", or similar.
 - **key <name> <key>** — press a key in peer (enter, ctrl-c, tab, arrows, …)
 - **tail <name>** — read recent output from peer
 - **kill <name>** — terminate peer
+
+> **IMPORTANT — send vs write defaults**: If the user's request is anything other than an explicit draft ("draft…", "prefill…", "don't submit yet…"), use ` + "`ab sessions send`" + `. Natural-language verbs like "send", "write", "tell", "ask", "message", "deliver", "pass" all map to ` + "`send`" + ` (auto-submit). Using ` + "`write`" + ` when the user expected a submit results in a session where nothing happens — the message just sits in the input box.
 
 ## Subcommands
 
@@ -4448,8 +4450,11 @@ If ` + "`jq`" + ` isn't available, grep the JSON and extract the ` + "`id`" + ` 
 | "create ab session test"                   | ` + "`ab sessions create -shell -project /tmp -name test`" + ` → grab id → ` + "`ab sessions meta <id> --label test`" + ` |
 | "create sessions s1, s2, s3"               | loop each name: create + meta --label                                                           |
 | "list sessions"                            | ` + "`ab sessions list`" + `                                                                     |
-| "send to dev1: please build the login form" (fire off) | resolve dev1 → ` + "`ab sessions send  <id> \"please build the login form\"`" + `   |
-| "draft for dev1: …" / "prefill dev1's input" | resolve dev1 → ` + "`ab sessions write <id> \"...\"`" + ` (user reviews & presses Enter)        |
+| "send to dev1: …"                          | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `                                   |
+| "write to dev1: …" / "message dev1 …"      | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `  ← still send (auto-submit)        |
+| "tell dev1 to …"                           | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `                                   |
+| "ask dev1 what …"                          | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `                                   |
+| "draft for dev1: …" / "prefill dev1's input" / "don't submit yet" | resolve dev1 → ` + "`ab sessions write <id> \"...\"`" + ` (no Enter; user reviews manually) |
 | "tell dev1 to stop" / "cancel dev1"        | resolve dev1 → ` + "`ab sessions key  <id> ctrl-c`" + `                                        |
 | "tail dev1 last 40 lines"                  | resolve dev1 → ` + "`ab sessions tail <id> --lines 40`" + `                                   |
 | "kill test session"                        | resolve test → ` + "`ab sessions kill <id>`" + `                                                |
