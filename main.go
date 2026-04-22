@@ -3277,17 +3277,33 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		if body.Enter != nil {
 			enter = *body.Enter
 		}
+		// Write text first. Then, if enter is requested, write the Enter byte
+		// as a SEPARATE write with a small pause. TUI apps (Claude Code, Codex)
+		// that read stdin with bracketed-paste heuristics treat a single
+		// `text + \r` write as a paste — the `\r` becomes a newline inside the
+		// input box and the message never submits. Splitting the write makes
+		// the Enter look like a real key press after the typed text.
+		total := 0
+		if payload != "" {
+			n, err := s.Pty.Write([]byte(payload))
+			if err != nil {
+				writeError(w, 500, fmt.Sprintf("Write failed: %v", err))
+				return
+			}
+			total += n
+		}
 		if enter && !strings.HasSuffix(payload, "\r") && !strings.HasSuffix(payload, "\n") {
-			// Use \r (CR) — what a real terminal emits when the user presses
-			// Enter. Raw-mode TUI apps (Claude Code, Codex) need \r to submit;
-			// cooked-mode shells translate it to \n via ICANON so both work.
-			payload += "\r"
+			// 30ms is enough for any TUI's input debounce to treat the next
+			// write as a separate event. Tested with Claude Code / Codex / bash.
+			time.Sleep(30 * time.Millisecond)
+			n, err := s.Pty.Write([]byte("\r"))
+			if err != nil {
+				writeError(w, 500, fmt.Sprintf("Enter-write failed: %v", err))
+				return
+			}
+			total += n
 		}
-		if _, err := s.Pty.Write([]byte(payload)); err != nil {
-			writeError(w, 500, fmt.Sprintf("Write failed: %v", err))
-			return
-		}
-		writeJSON(w, 0, map[string]interface{}{"ok": true, "bytes": len(payload)})
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "bytes": total})
 
 	case action == "key" && r.Method == "POST":
 		// Inject a special key press (Enter, Tab, Escape, Ctrl-C, arrow keys,
