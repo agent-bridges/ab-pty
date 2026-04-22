@@ -4394,6 +4394,16 @@ into this session's env by the PTY daemon). No auth flags needed.
 
 Use ` + "`ab`" + ` to orchestrate sibling sessions on THIS host.
 
+## Quick menu (present this to the user)
+
+- **list sessions** — show all peer sessions
+- **create session <name>** — spawn a new session labelled ` + "`<name>`" + `
+- **send to <name>: <message>** — write + auto-submit into peer (fire-off)
+- **write to <name>: <message>** — prefill peer's input, let user press Enter
+- **key <name> <key>** — press a key in peer (enter, ctrl-c, tab, arrows, …)
+- **tail <name>** — read recent output from peer
+- **kill <name>** — terminate peer
+
 ## Subcommands
 
 - ` + "`ab sessions list`" + ` — JSON array of all sessions on this daemon.
