@@ -4272,11 +4272,12 @@ func mcpToolResult(id interface{}, text string) string {
 // and refresh it across daemon versions without overwriting user edits.
 const abSkillMarkerV1 = "<!-- ab-skill v1 generated-by=ab-pty -->"
 
-const abSkillBody = `<!-- ab-skill v1 generated-by=ab-pty -->
----
+const abSkillBody = `---
 name: ab-pty-multi-agent
 description: Use when the user asks to create, list, send to, tail, or kill PTY sessions in AB (multi-agent orchestration on this host). Triggers on phrases like "create ab session", "list sessions", "send to <name>", "tail <name>", "kill session <name>".
 ---
+
+<!-- ab-skill v1 generated-by=ab-pty -->
 
 # AB PTY sessions
 
