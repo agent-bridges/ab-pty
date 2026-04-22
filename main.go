@@ -832,7 +832,8 @@ Usage:
   ab sessions get    <pty_id>
   ab sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
   ab sessions kill   <pty_id>
-  ab sessions write  <pty_id> "text" [--no-enter]     # alias: send
+  ab sessions write  <pty_id> "text" [--no-enter]     # alias: send — auto-adds \r
+  ab sessions key    <pty_id> <key>                   # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
   ab sessions tail   <pty_id> [--lines N]             # alias: peek
   ab sessions meta   <pty_id> [--label L] [--set k=v ...]
   ab sessions lock   <pty_id>
@@ -841,6 +842,7 @@ Usage:
 Examples (inside a PTY session, with $AB_PTY_SESSION_TOKEN preset):
   ab sessions list
   ab sessions write pty_123 "please write the login form"
+  ab sessions key   pty_123 enter                     # explicit Enter keypress
   ab sessions tail  pty_123 --lines 40
 
 Note: the 'ab' command is a wrapper for 'ab-pty client'. If the wrapper
@@ -948,6 +950,14 @@ func runClientSessions(args []string) {
 		}
 		body, _ := json.Marshal(payload)
 		out, err := cliRequest("PATCH", "/api/pty/"+target+"/meta", body)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "key":
+		requireArg(rest, 1, "key", "<pty_id> <key>  (enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|...)")
+		target := rest[0]
+		keyName := rest[1]
+		body, _ := json.Marshal(map[string]interface{}{"key": keyName})
+		out, err := cliRequest("POST", "/api/pty/"+target+"/key", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "lock":
@@ -3249,14 +3259,93 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		if body.Enter != nil {
 			enter = *body.Enter
 		}
-		if enter && !strings.HasSuffix(payload, "\n") {
-			payload += "\n"
+		if enter && !strings.HasSuffix(payload, "\r") && !strings.HasSuffix(payload, "\n") {
+			// Use \r (CR) — what a real terminal emits when the user presses
+			// Enter. Raw-mode TUI apps (Claude Code, Codex) need \r to submit;
+			// cooked-mode shells translate it to \n via ICANON so both work.
+			payload += "\r"
 		}
 		if _, err := s.Pty.Write([]byte(payload)); err != nil {
 			writeError(w, 500, fmt.Sprintf("Write failed: %v", err))
 			return
 		}
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "bytes": len(payload)})
+
+	case action == "key" && r.Method == "POST":
+		// Inject a special key press (Enter, Tab, Escape, Ctrl-C, arrow keys,
+		// etc.) into a session's stdin. Maps symbolic names to the same byte
+		// sequences a terminal emits when the physical key is pressed.
+		sessionsMu.RLock()
+		s, exists := sessions[sessionID]
+		sessionsMu.RUnlock()
+		if !exists {
+			writeError(w, 404, "Session not found")
+			return
+		}
+		if !s.Alive {
+			writeError(w, 409, "Session is not alive")
+			return
+		}
+		var body struct {
+			Key string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, 400, "Invalid JSON body")
+			return
+		}
+		var bytes []byte
+		switch strings.ToLower(body.Key) {
+		case "enter", "return", "cr":
+			bytes = []byte("\r")
+		case "lf", "newline":
+			bytes = []byte("\n")
+		case "crlf":
+			bytes = []byte("\r\n")
+		case "tab":
+			bytes = []byte("\t")
+		case "escape", "esc":
+			bytes = []byte{0x1b}
+		case "backspace", "bs":
+			bytes = []byte{0x7f}
+		case "space":
+			bytes = []byte(" ")
+		case "up":
+			bytes = []byte("\x1b[A")
+		case "down":
+			bytes = []byte("\x1b[B")
+		case "right":
+			bytes = []byte("\x1b[C")
+		case "left":
+			bytes = []byte("\x1b[D")
+		case "home":
+			bytes = []byte("\x1b[H")
+		case "end":
+			bytes = []byte("\x1b[F")
+		case "pageup", "pgup":
+			bytes = []byte("\x1b[5~")
+		case "pagedown", "pgdn":
+			bytes = []byte("\x1b[6~")
+		case "ctrl-c", "c-c":
+			bytes = []byte{0x03}
+		case "ctrl-d", "c-d":
+			bytes = []byte{0x04}
+		case "ctrl-z", "c-z":
+			bytes = []byte{0x1a}
+		case "ctrl-l", "c-l":
+			bytes = []byte{0x0c}
+		case "ctrl-u", "c-u":
+			bytes = []byte{0x15}
+		case "ctrl-w", "c-w":
+			bytes = []byte{0x17}
+		default:
+			writeError(w, 400, fmt.Sprintf("Unknown key: %q (use enter, tab, esc, backspace, up, down, left, right, ctrl-c, ctrl-d, ctrl-z, ...)", body.Key))
+			return
+		}
+		if _, err := s.Pty.Write(bytes); err != nil {
+			writeError(w, 500, fmt.Sprintf("Write failed: %v", err))
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "key": body.Key, "bytes": len(bytes)})
 
 	case action == "scrollback" && r.Method == "GET":
 		// Return recent scrollback as plain text. Used by `ab-pty client sessions tail`.
@@ -4292,7 +4381,8 @@ Use ` + "`ab`" + ` to orchestrate sibling sessions on THIS host.
 - ` + "`ab sessions list`" + ` — JSON array of all sessions on this daemon.
 - ` + "`ab sessions get <pty_id>`" + ` — JSON details for one session.
 - ` + "`ab sessions create -shell -project <cwd> -name <name>`" + ` — create a shell session.
-- ` + "`ab sessions write <pty_id> \"<text>\"`" + ` — inject text into a session's stdin (a trailing Enter is added unless ` + "`--no-enter`" + ` is passed).
+- ` + "`ab sessions write <pty_id> \"<text>\"`" + ` — inject text into a session's stdin. A trailing Enter (CR, ` + "`\\r`" + `) is appended automatically unless ` + "`--no-enter`" + ` is passed. Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
+- ` + "`ab sessions key <pty_id> <key>`" + ` — send an explicit key press. Supported: ` + "`enter`" + `, ` + "`tab`" + `, ` + "`esc`" + `, ` + "`backspace`" + `, ` + "`up`" + `, ` + "`down`" + `, ` + "`left`" + `, ` + "`right`" + `, ` + "`home`" + `, ` + "`end`" + `, ` + "`pageup`" + `, ` + "`pagedown`" + `, ` + "`ctrl-c`" + `, ` + "`ctrl-d`" + `, ` + "`ctrl-z`" + `, ` + "`ctrl-l`" + `, ` + "`ctrl-u`" + `, ` + "`ctrl-w`" + `. Use this when ` + "`write`" + ` isn't the right fit (e.g. interrupting a running command, navigating a TUI menu, sending a second Enter on its own).
 - ` + "`ab sessions tail  <pty_id> --lines 50`" + ` — read recent scrollback as JSON.
 - ` + "`ab sessions kill  <pty_id>`" + ` — terminate a session.
 - ` + "`ab sessions meta  <pty_id> --label <L> [--set k=v ...]`" + ` — set the **display label** (what the user sees on the canvas).
