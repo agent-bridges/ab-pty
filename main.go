@@ -4270,7 +4270,7 @@ func mcpToolResult(id interface{}, text string) string {
 // to use the in-session `ab` CLI when the user asks in natural language.
 // The header comment lets ensureAbSkillInstalled() detect our own file
 // and refresh it across daemon versions without overwriting user edits.
-const abSkillMarkerV1 = "<!-- ab-skill v1 generated-by=ab-pty -->"
+const abSkillMarkerV1 = "generated-by=ab-pty"
 
 const abSkillBody = `---
 name: ab-pty-multi-agent
@@ -4295,8 +4295,20 @@ Use ` + "`ab`" + ` to orchestrate sibling sessions on THIS host.
 - ` + "`ab sessions write <pty_id> \"<text>\"`" + ` — inject text into a session's stdin (a trailing Enter is added unless ` + "`--no-enter`" + ` is passed).
 - ` + "`ab sessions tail  <pty_id> --lines 50`" + ` — read recent scrollback as JSON.
 - ` + "`ab sessions kill  <pty_id>`" + ` — terminate a session.
-- ` + "`ab sessions meta  <pty_id> --label <L> [--set k=v ...]`" + ` — rename or set custom meta.
+- ` + "`ab sessions meta  <pty_id> --label <L> [--set k=v ...]`" + ` — set the **display label** (what the user sees on the canvas).
 - ` + "`ab sessions lock <pty_id>`" + ` / ` + "`ab sessions unlock <pty_id>`" + `.
+
+## Display label vs. -name
+
+When creating a session with a **user-visible name** like "s1" / "dev1" / "test":
+
+1. Create: ` + "`ab sessions create -shell -project /tmp -name s1`" + ` → get ` + "`<pty_id>`" + `.
+2. Then **set the display label** so the canvas shows it:
+   ` + "`ab sessions meta <pty_id> --label s1`" + `
+
+Without step 2, the canvas derives the label from the cwd (e.g. ` + "`tmp-#XXXXXX`" + `) and
+ignores the internal ` + "`-name`" + `. Always run both steps when the user asked for a
+named session.
 
 ## Resolving names → pty_id
 
@@ -4312,14 +4324,15 @@ If ` + "`jq`" + ` isn't available, grep the JSON and extract the ` + "`id`" + ` 
 
 ## Natural-language examples
 
-| User says                                  | You run                                                       |
-| ------------------------------------------ | ------------------------------------------------------------- |
-| "create ab session test"                   | ` + "`ab sessions create -shell -project /tmp -name test`" + `  |
-| "list sessions"                            | ` + "`ab sessions list`" + `                                  |
-| "send to dev1: please build the login form" | resolve dev1 → ` + "`ab sessions write <id> \"please build the login form\"`" + ` |
-| "tail dev1 last 40 lines"                  | resolve dev1 → ` + "`ab sessions tail <id> --lines 40`" + ` |
-| "kill test session"                        | resolve test → ` + "`ab sessions kill <id>`" + `              |
-| "rename session <id> to dev2"              | ` + "`ab sessions meta <id> --label dev2`" + `                |
+| User says                                  | You run                                                                                         |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| "create ab session test"                   | ` + "`ab sessions create -shell -project /tmp -name test`" + ` → grab id → ` + "`ab sessions meta <id> --label test`" + ` |
+| "create sessions s1, s2, s3"               | loop each name: create + meta --label                                                           |
+| "list sessions"                            | ` + "`ab sessions list`" + `                                                                     |
+| "send to dev1: please build the login form" | resolve dev1 by label → ` + "`ab sessions write <id> \"please build the login form\"`" + `      |
+| "tail dev1 last 40 lines"                  | resolve dev1 → ` + "`ab sessions tail <id> --lines 40`" + `                                   |
+| "kill test session"                        | resolve test → ` + "`ab sessions kill <id>`" + `                                                |
+| "rename session <id> to dev2"              | ` + "`ab sessions meta <id> --label dev2`" + `                                                  |
 
 ## Notes
 
