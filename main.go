@@ -3292,7 +3292,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			}
 			total += n
 		}
-		if enter && !strings.HasSuffix(payload, "\r") && !strings.HasSuffix(payload, "\n") {
+		if enter {
 			// 30ms is enough for any TUI's input debounce to treat the next
 			// write as a separate event. Tested with Claude Code / Codex / bash.
 			time.Sleep(30 * time.Millisecond)
