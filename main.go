@@ -1164,6 +1164,8 @@ Environment variables:
 	http.HandleFunc("/api/fs/download", sessionTokenOrJwt(handleFSDownload))
 	http.HandleFunc("/api/fs/upload", sessionTokenOrJwt(handleFSUpload))
 	http.HandleFunc("/api/paste-image", sessionTokenOrJwt(handlePasteImage))
+	http.HandleFunc("/api/tunnels", sessionTokenOrJwt(handleTunnels))
+	http.HandleFunc("/api/tunnels/", sessionTokenOrJwt(handleTunnels))
 	http.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
 	http.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
 
@@ -5050,4 +5052,208 @@ func findPtyIDByCwd(cwd string) string {
 		}
 	}
 	return ""
+}
+
+// === SSH tunnels (`tu` shell helper) =======================================
+//
+// Thin HTTP wrapper around the host-side `tu` script (see /lxd-exch/system/tu).
+// The script forwards local ports to a fixed vultr host via `(auto)ssh -R`.
+// Three verbs:
+//   GET  /api/tunnels                — `tu ls`, parsed into JSON
+//   POST /api/tunnels  {src,dst,detached?}
+//                                    — `tu [-d] src:dst`, returns parsed list
+//   DELETE /api/tunnels/{pid}        — `tu k <pid>`
+//
+// `tu` is host-only and not bundled with the daemon. If it's not on PATH or
+// not at the canonical path, every endpoint returns 200 with `installed:false`
+// so the UI can render a placeholder rather than treating it as an error.
+
+const tuCanonicalPath = "/lxd-exch/system/tu"
+
+// resolveTuPath returns the path to the `tu` script, or "" if not found.
+// Order: $TU_PATH override → canonical path → $PATH lookup.
+func resolveTuPath() string {
+	if p := os.Getenv("TU_PATH"); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	if _, err := os.Stat(tuCanonicalPath); err == nil {
+		return tuCanonicalPath
+	}
+	if p, err := exec.LookPath("tu"); err == nil {
+		return p
+	}
+	return ""
+}
+
+type tunnelEntry struct {
+	PID     string `json:"pid"`
+	SrcPort string `json:"src_port"` // local port (your machine)
+	DstPort string `json:"dst_port"` // public port (vultr)
+	URL     string `json:"url"`
+	Status  string `json:"status"`
+}
+
+// parseTuLs parses the column output of `tu ls`:
+//
+//	PID      LOCAL        URL                                 STATUS
+//	---      -----        ---                                 ------
+//	12345    :3000        http://209.250.240.193:30001       running
+//
+// LOCAL = ":<src_port>"; URL ends in ":<dst_port>". Dashes/header are skipped.
+func parseTuLs(out string) []tunnelEntry {
+	rows := []tunnelEntry{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		// Skip header + separator rows.
+		if fields[0] == "PID" || strings.HasPrefix(fields[0], "---") {
+			continue
+		}
+		// PID must be numeric.
+		if _, err := strconv.Atoi(fields[0]); err != nil {
+			continue
+		}
+		src := strings.TrimPrefix(fields[1], ":")
+		url := fields[2]
+		status := fields[3]
+		// Dst port = trailing :<num> in URL.
+		dst := ""
+		if i := strings.LastIndex(url, ":"); i >= 0 && i+1 < len(url) {
+			dst = url[i+1:]
+		}
+		rows = append(rows, tunnelEntry{
+			PID:     fields[0],
+			SrcPort: src,
+			DstPort: dst,
+			URL:     url,
+			Status:  status,
+		})
+	}
+	return rows
+}
+
+// runTu executes `tu` with the given args and returns stdout + stderr combined.
+// Caller is responsible for argument validation (we accept only known shapes).
+func runTu(args ...string) (string, error) {
+	tuPath := resolveTuPath()
+	if tuPath == "" {
+		return "", fmt.Errorf("tu not installed")
+	}
+	cmd := exec.Command(tuPath, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func handleTunnels(w http.ResponseWriter, r *http.Request) {
+	tuPath := resolveTuPath()
+
+	switch r.Method {
+	case http.MethodGet:
+		if tuPath == "" {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"installed": false,
+				"tunnels":   []tunnelEntry{},
+				"message":   "tu not installed on this host",
+			})
+			return
+		}
+		out, err := runTu("ls")
+		if err != nil && !strings.Contains(out, "No active tunnels") {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("tu ls failed: %v: %s", err, out))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"installed": true,
+			"tunnels":   parseTuLs(out),
+		})
+
+	case http.MethodPost:
+		if tuPath == "" {
+			writeError(w, http.StatusServiceUnavailable, "tu not installed on this host")
+			return
+		}
+		var body struct {
+			SrcPort  string `json:"src_port"`
+			DstPort  string `json:"dst_port"`
+			Detached bool   `json:"detached"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		// Validate ports are positive integers, no shell metacharacters.
+		if !isPortNumber(body.SrcPort) || !isPortNumber(body.DstPort) {
+			writeError(w, http.StatusBadRequest, "src_port and dst_port must be positive integers")
+			return
+		}
+		args := []string{}
+		if body.Detached {
+			args = append(args, "-d")
+		}
+		args = append(args, body.SrcPort+":"+body.DstPort)
+		out, err := runTu(args...)
+		if err != nil && !body.Detached {
+			// Foreground mode never returns from `exec ssh` cleanly — but the
+			// daemon should never invoke without -d (we'd block forever). If
+			// the user posts without detached=true, force it on so the call
+			// returns instead of hanging the connection.
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("tu failed: %v: %s", err, out))
+			return
+		}
+		// Re-list to return the canonical state (PID may have changed).
+		listOut, _ := runTu("ls")
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"installed":   true,
+			"tunnels":     parseTuLs(listOut),
+			"create_log":  out,
+		})
+
+	case http.MethodDelete:
+		if tuPath == "" {
+			writeError(w, http.StatusServiceUnavailable, "tu not installed on this host")
+			return
+		}
+		// Path: /api/tunnels/{pid}
+		pid := strings.TrimPrefix(r.URL.Path, "/api/tunnels/")
+		pid = strings.TrimSuffix(pid, "/")
+		if pid == "" {
+			writeError(w, http.StatusBadRequest, "pid required")
+			return
+		}
+		// Allow numeric PID or literal '*' (kill-all). Nothing else.
+		if pid != "*" {
+			if _, err := strconv.Atoi(pid); err != nil {
+				writeError(w, http.StatusBadRequest, "pid must be numeric or '*'")
+				return
+			}
+		}
+		out, err := runTu("k", pid)
+		if err != nil && !strings.Contains(out, "Killing PID") {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("tu k %s failed: %v: %s", pid, err, out))
+			return
+		}
+		listOut, _ := runTu("ls")
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"installed":  true,
+			"tunnels":    parseTuLs(listOut),
+			"kill_log":   out,
+		})
+
+	default:
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// isPortNumber returns true iff s is a base-10 unsigned int 1..65535.
+func isPortNumber(s string) bool {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 || n > 65535 {
+		return false
+	}
+	return true
 }
