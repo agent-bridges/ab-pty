@@ -840,6 +840,12 @@ Usage:
   ab sessions lock   <pty_id>
   ab sessions unlock <pty_id>
 
+  ab notes list
+  ab notes get    <id>
+  ab notes create [-name "title"] [-content "body"|-]   # -content - reads stdin
+  ab notes set    <id> "<content>" [--label NAME]       # content "-" reads stdin
+  ab notes delete <id>
+
 Behaviour of send vs write:
   send  — you want the peer agent to ACT on the text immediately (fire off a task).
   write — you want the peer's input buffer PRE-FILLED but leave the human / the
@@ -854,6 +860,9 @@ Examples (inside a PTY session, with $AB_PTY_SESSION_TOKEN preset):
   ab sessions write pty_123 "/refactor-component Button"    # draft; user edits & presses Enter
   ab sessions key   pty_123 enter                           # explicit Enter keypress
   ab sessions tail  pty_123 --lines 40
+  ab notes create -name plan -content "Step 1: …"
+  cat plan.md | ab notes create -name plan -content -      # pipe big bodies in
+  ab notes set    note-1234-ab "new body" --label "renamed"
 
 Note: the 'ab' command is a wrapper for 'ab-pty client'. If the wrapper
 isn't installed, run 'ab-pty client sessions list' directly.
@@ -868,9 +877,155 @@ func runClient(args []string) {
 	switch args[0] {
 	case "sessions":
 		runClientSessions(args[1:])
+	case "notes":
+		runClientNotes(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown client subcommand: %s\n", args[0])
 		clientHelp()
+		os.Exit(2)
+	}
+}
+
+// runClientNotes — `ab notes ...` CLI. Notes are board_items of type "notes"
+// stored in the daemon's SQLite (canonical canvas-component source of truth).
+// Subcommands:
+//
+//	ab notes list                    — JSON array of all notes-type items
+//	ab notes get <id>                — JSON for one note
+//	ab notes create [-name "title"] [-content "body"]  — new note, prints id
+//	ab notes set <id> "<content>"    — overwrite the note's content (and
+//	                                   optional --label "x" to rename)
+//	ab notes delete <id>             — remove
+func runClientNotes(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: ab notes <list|get|create|set|delete> ...")
+		os.Exit(2)
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "list":
+		out, err := cliRequest("GET", "/api/board/items", nil)
+		requireOK(err)
+		// Filter to type=="notes". Server returns the full board mix; agents
+		// usually only care about notes for this CLI.
+		var items []map[string]interface{}
+		if err := json.Unmarshal(out, &items); err != nil {
+			fmt.Println(string(out))
+			return
+		}
+		notes := items[:0]
+		for _, it := range items {
+			if t, _ := it["type"].(string); t == "notes" {
+				notes = append(notes, it)
+			}
+		}
+		buf, _ := json.MarshalIndent(notes, "", "  ")
+		fmt.Println(string(buf))
+
+	case "get":
+		requireArg(rest, 0, "get", "<id>")
+		out, err := cliRequest("GET", "/api/board/items", nil)
+		requireOK(err)
+		var items []map[string]interface{}
+		if err := json.Unmarshal(out, &items); err != nil {
+			fmt.Println(string(out))
+			return
+		}
+		for _, it := range items {
+			if id, _ := it["id"].(string); id == rest[0] {
+				buf, _ := json.MarshalIndent(it, "", "  ")
+				fmt.Println(string(buf))
+				return
+			}
+		}
+		fmt.Fprintf(os.Stderr, "note not found: %s\n", rest[0])
+		os.Exit(1)
+
+	case "create":
+		// Flags: -name <label>, -content <body>. If body is "-" read stdin.
+		// Stdin lets you pipe big notes: `cat plan.md | ab notes create -name plan -content -`.
+		label := ""
+		content := ""
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case "-name", "--name":
+				if i+1 < len(rest) { label = rest[i+1]; i++ }
+			case "-content", "--content":
+				if i+1 < len(rest) { content = rest[i+1]; i++ }
+			}
+		}
+		if content == "-" {
+			b, err := io.ReadAll(os.Stdin)
+			requireOK(err)
+			content = string(b)
+		}
+		// Random suffix from crypto/rand keeps ids collision-resistant even if
+		// two CLI calls land in the same Unix second.
+		var randB [4]byte
+		_, _ = rand.Read(randB[:])
+		id := fmt.Sprintf("note-%d-%s", time.Now().Unix(), hex.EncodeToString(randB[:]))
+		if label == "" {
+			label = "Note"
+		}
+		body, _ := json.Marshal(map[string]interface{}{
+			"type":        "notes",
+			"label":       label,
+			"noteContent": content,
+		})
+		_, err := cliRequest("PUT", "/api/board/items/"+url.PathEscape(id), body)
+		requireOK(err)
+		fmt.Println(`{"ok":true,"id":"` + id + `"}`)
+
+	case "set":
+		requireArg(rest, 1, "set", "<id> \"<content>\" [--label NAME]")
+		id := rest[0]
+		content := rest[1]
+		if content == "-" {
+			b, err := io.ReadAll(os.Stdin)
+			requireOK(err)
+			content = string(b)
+		}
+		// Pull the existing item so we don't trash unrelated fields (label).
+		listOut, err := cliRequest("GET", "/api/board/items", nil)
+		requireOK(err)
+		var items []map[string]interface{}
+		json.Unmarshal(listOut, &items)
+		var current map[string]interface{}
+		for _, it := range items {
+			if iid, _ := it["id"].(string); iid == id {
+				current = it
+				break
+			}
+		}
+		if current == nil {
+			fmt.Fprintf(os.Stderr, "note not found: %s\n", id)
+			os.Exit(1)
+		}
+		label, _ := current["label"].(string)
+		for i := 2; i < len(rest); i++ {
+			if (rest[i] == "--label" || rest[i] == "-label") && i+1 < len(rest) {
+				label = rest[i+1]
+				i++
+			}
+		}
+		body, _ := json.Marshal(map[string]interface{}{
+			"type":        "notes",
+			"label":       label,
+			"noteContent": content,
+		})
+		_, err = cliRequest("PUT", "/api/board/items/"+url.PathEscape(id), body)
+		requireOK(err)
+		fmt.Println(`{"ok":true,"id":"` + id + `"}`)
+
+	case "delete":
+		requireArg(rest, 0, "delete", "<id>")
+		_, err := cliRequest("DELETE", "/api/board/items/"+url.PathEscape(rest[0]), nil)
+		requireOK(err)
+		fmt.Println(`{"ok":true}`)
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown notes subcommand: %s\n", sub)
 		os.Exit(2)
 	}
 }
@@ -2316,6 +2471,26 @@ func broadcastPtyState() {
 	}
 }
 
+// broadcastBoardItemsChanged notifies all /ws/pty-state subscribers that the
+// daemon's board_items table mutated (upsert / delete / sync). Front debounces
+// and re-fetches the list — payload-less so we don't have to enumerate diffs.
+// This is what makes `ab notes create` from a peer agent appear live in the UI
+// without a page reload.
+func broadcastBoardItemsChanged() {
+	msg, _ := json.Marshal(map[string]interface{}{"type": "board_items_changed"})
+
+	subsMu.RLock()
+	subs := make([]*SafeConn, 0, len(ptySubscribers))
+	for ws := range ptySubscribers {
+		subs = append(subs, ws)
+	}
+	subsMu.RUnlock()
+
+	for _, ws := range subs {
+		ws.WriteMessage(websocket.TextMessage, msg)
+	}
+}
+
 // === Projects Indexer ===
 
 func initProjectsIndexer() {
@@ -3463,6 +3638,7 @@ func handleBoardItems(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "Failed to sync board items")
 			return
 		}
+		go broadcastBoardItemsChanged()
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "count": len(payload.Items)})
 		return
 	}
@@ -3489,6 +3665,7 @@ func handleBoardItems(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "Failed to save board item")
 			return
 		}
+		go broadcastBoardItemsChanged()
 		writeJSON(w, 0, map[string]interface{}{"ok": true})
 	case http.MethodDelete:
 		deleted, err := deleteBoardItem(itemID)
@@ -3500,6 +3677,7 @@ func handleBoardItems(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "Board item not found")
 			return
 		}
+		go broadcastBoardItemsChanged()
 		writeJSON(w, 0, map[string]interface{}{"ok": true})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
