@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -1444,6 +1445,10 @@ func initDB() {
 	db.Exec(`ALTER TABLE session_meta ADD COLUMN active INTEGER DEFAULT 0`)
 	db.Exec(`ALTER TABLE board_items ADD COLUMN x INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE board_items ADD COLUMN y INTEGER NOT NULL DEFAULT 0`)
+	// Tags are JSON-encoded []string. Free-form labels users attach to items;
+	// many items per tag, many tags per item. IDE-mode sidebar renders a
+	// section per distinct tag. Default '[]' so existing rows are valid.
+	db.Exec(`ALTER TABLE board_items ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`)
 
 	// Projects indexer tables
 	_, err = db.Exec(`
@@ -1485,12 +1490,16 @@ func initDB() {
 }
 
 type BoardItemRecord struct {
-	ID          string `json:"id"`
-	Type        string `json:"type"`
-	Label       string `json:"label"`
-	PtyID       string `json:"ptyId,omitempty"`
-	NoteContent string `json:"noteContent,omitempty"`
-	CurrentPath string `json:"currentPath,omitempty"`
+	ID          string   `json:"id"`
+	Type        string   `json:"type"`
+	Label       string   `json:"label"`
+	PtyID       string   `json:"ptyId,omitempty"`
+	NoteContent string   `json:"noteContent,omitempty"`
+	CurrentPath string   `json:"currentPath,omitempty"`
+	// Free-form labels for IDE-mode organization. One item can have many
+	// tags; sidebar groups items by distinct tag name. Always serialised as
+	// a JSON array — never null — so the front can rely on the field.
+	Tags        []string `json:"tags"`
 }
 
 type BoardLayoutRecord struct {
@@ -1501,7 +1510,7 @@ type BoardLayoutRecord struct {
 
 func listBoardItems() ([]map[string]interface{}, error) {
 	rows, err := db.Query(`
-		SELECT id, type, label, pty_id, note_content, current_path
+		SELECT id, type, label, pty_id, note_content, current_path, tags
 		FROM board_items
 		ORDER BY updated_at DESC, created_at DESC, id ASC
 	`)
@@ -1523,7 +1532,8 @@ func listBoardItems() ([]map[string]interface{}, error) {
 	for rows.Next() {
 		var id, itemType, label string
 		var ptyID, noteContent, currentPath sql.NullString
-		if err := rows.Scan(&id, &itemType, &label, &ptyID, &noteContent, &currentPath); err != nil {
+		var tagsJSON sql.NullString
+		if err := rows.Scan(&id, &itemType, &label, &ptyID, &noteContent, &currentPath, &tagsJSON); err != nil {
 			return nil, err
 		}
 
@@ -1535,6 +1545,14 @@ func listBoardItems() ([]map[string]interface{}, error) {
 			}
 		}
 
+		// Tags are stored as JSON. Default to empty array so the front-end
+		// never sees null (`tags ?? []` would also work but explicit is
+		// safer for cross-language clients).
+		tags := []string{}
+		if tagsJSON.Valid && tagsJSON.String != "" {
+			_ = json.Unmarshal([]byte(tagsJSON.String), &tags)
+		}
+
 		items = append(items, map[string]interface{}{
 			"id":          id,
 			"type":        itemType,
@@ -1542,6 +1560,7 @@ func listBoardItems() ([]map[string]interface{}, error) {
 			"ptyId":       ptyID.String,
 			"noteContent": noteContent.String,
 			"currentPath": currentPath.String,
+			"tags":        tags,
 		})
 	}
 
@@ -1562,17 +1581,26 @@ func upsertBoardItem(item BoardItemRecord) error {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	// Normalise tags to a JSON array. Nil/empty becomes "[]" so subsequent
+	// reads always parse to a real slice. Trim/dedupe is the front-end's
+	// job; we just persist whatever it sends.
+	tags := item.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+	tagsJSON, _ := json.Marshal(tags)
 	_, err := db.Exec(`
-		INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, tags, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			type = excluded.type,
 			label = excluded.label,
 			pty_id = excluded.pty_id,
 			note_content = excluded.note_content,
 			current_path = excluded.current_path,
+			tags = excluded.tags,
 			updated_at = excluded.updated_at
-	`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now)
+	`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, string(tagsJSON), now, now)
 	return err
 }
 
@@ -1604,10 +1632,15 @@ func syncBoardItems(items []BoardItemRecord) error {
 		if item.ID == "" || item.Type == "" {
 			return fmt.Errorf("invalid board item")
 		}
+		tags := item.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		tagsJSON, _ := json.Marshal(tags)
 		if _, err := tx.Exec(`
-			INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, now, now); err != nil {
+			INSERT INTO board_items (id, type, label, pty_id, note_content, current_path, tags, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, item.ID, item.Type, item.Label, item.PtyID, item.NoteContent, item.CurrentPath, string(tagsJSON), now, now); err != nil {
 			return err
 		}
 	}
@@ -4568,147 +4601,107 @@ func mcpToolResult(id interface{}, text string) string {
 	})
 }
 
-// abSkillBody is the content installed into Claude Code skills and
-// Codex AGENTS.md so both agents, running inside a PTY session, know how
-// to use the in-session `ab` CLI when the user asks in natural language.
-// The header comment lets ensureAbSkillInstalled() detect our own file
-// and refresh it across daemon versions without overwriting user edits.
+// Skills installed into Claude Code (one dir per skill) and into Codex
+// (single AGENTS.md, all skills concatenated). The marker lets the
+// daemon detect its own files and refresh them on upgrade without
+// clobbering user edits. Each skill's source is `skills/<name>.md`
+// embedded at build time; users can override per-skill by setting
+// AB_PTY_SKILLS_DIR=/path/to/skills and dropping a same-named .md there.
 const abSkillMarkerV1 = "generated-by=ab-pty"
 
-const abSkillBody = `---
-name: ab-pty-multi-agent
-description: Use when the user asks to create, list, send to, tail, or kill PTY sessions in AB (multi-agent orchestration on this host). Triggers on phrases like "create ab session", "list sessions", "send to <name>", "tail <name>", "kill session <name>".
----
+//go:embed skills/ab.md
+var defaultAbSkill string
 
-<!-- ab-skill v1 generated-by=ab-pty -->
+//go:embed skills/ab-team-protocol.md
+var defaultAbTeamProtocolSkill string
 
-# AB PTY sessions
+// skillBundle is one entry in the install set. The order in installedSkills
+// is also the concatenation order written into Codex's single AGENTS.md.
+type skillBundle struct {
+	name     string // dir name under ~/.claude/skills/<name>/SKILL.md
+	embedded string // baked-in default content
+}
 
-You are running inside an AB PTY session. A local CLI ` + "`ab`" + ` is available on
-PATH and authenticated automatically via ` + "`$AB_PTY_SESSION_TOKEN`" + ` (injected
-into this session's env by the PTY daemon). No auth flags needed.
+var installedSkills = []skillBundle{
+	{name: "ab", embedded: defaultAbSkill},
+	{name: "ab-team-protocol", embedded: defaultAbTeamProtocolSkill},
+}
 
-Use ` + "`ab`" + ` to orchestrate sibling sessions on THIS host.
+// loadSkillBody returns the body for a skill plus the source it came from
+// (for logging). Precedence: ${AB_PTY_SKILLS_DIR}/<name>.md if set and the
+// file is non-empty, else the embedded default. No hard-coded fallback
+// paths — host customisation is opt-in via the env var.
+func loadSkillBody(name, embedded string) (body string, source string) {
+	if dir := strings.TrimSpace(os.Getenv("AB_PTY_SKILLS_DIR")); dir != "" {
+		p := filepath.Join(dir, name+".md")
+		if data, err := os.ReadFile(p); err == nil && len(data) > 0 {
+			return string(data), p
+		}
+	}
+	return embedded, "embedded"
+}
 
-## Quick menu (present this to the user)
-
-- **list sessions** — show all peer sessions
-- **create session <name>** — spawn a new session labelled ` + "`<name>`" + `
-- **send to <name>: <message>** — fire a message at the peer and auto-submit it (this is the default for "send", "tell", "ask", "forward", "message", and any other verb that means the peer should ACT on the text)
-- **write draft to <name>: <message>** — (rare) prefill the peer's input without submitting. Use ONLY when the user explicitly says "draft", "prefill", "prepare without sending", "don't press enter yet", or similar.
-- **key <name> <key>** — press a key in peer (enter, ctrl-c, tab, arrows, …)
-- **tail <name>** — read recent output from peer
-- **kill <name>** — terminate peer
-
-> **IMPORTANT — send vs write defaults**: If the user's request is anything other than an explicit draft ("draft…", "prefill…", "don't submit yet…"), use ` + "`ab sessions send`" + `. Natural-language verbs like "send", "write", "tell", "ask", "message", "deliver", "pass" all map to ` + "`send`" + ` (auto-submit). Using ` + "`write`" + ` when the user expected a submit results in a session where nothing happens — the message just sits in the input box.
-
-## Subcommands
-
-- ` + "`ab sessions list`" + ` — JSON array of all sessions on this daemon.
-- ` + "`ab sessions get <pty_id>`" + ` — JSON details for one session.
-- ` + "`ab sessions create -shell -project <cwd> -name <name>`" + ` — create a shell session.
-- ` + "`ab sessions send  <pty_id> \"<text>\"`" + ` — write text AND press Enter. Auto-submits. Use when the user wants the peer agent to act on the text IMMEDIATELY ("tell dev1 to …", "ask dev2 for …"). Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
-- ` + "`ab sessions write <pty_id> \"<text>\"`" + ` — write text ONLY, no Enter. The peer's input box is pre-filled; a human (or another explicit call) decides when to submit / edit the text. Use when the user wants to "draft" or "prefill" a message ("prepare a task for dev1 but let me review before sending").
-- ` + "`ab sessions key <pty_id> <key>`" + ` — send an explicit key press. Supported: ` + "`enter`" + `, ` + "`tab`" + `, ` + "`esc`" + `, ` + "`backspace`" + `, ` + "`up`" + `, ` + "`down`" + `, ` + "`left`" + `, ` + "`right`" + `, ` + "`home`" + `, ` + "`end`" + `, ` + "`pageup`" + `, ` + "`pagedown`" + `, ` + "`ctrl-c`" + `, ` + "`ctrl-d`" + `, ` + "`ctrl-z`" + `, ` + "`ctrl-l`" + `, ` + "`ctrl-u`" + `, ` + "`ctrl-w`" + `. Use to interrupt a running command (` + "`ctrl-c`" + `), navigate a TUI menu (arrows + ` + "`enter`" + `), or submit a previously-drafted ` + "`write`" + ` (` + "`enter`" + `).
-- ` + "`ab sessions tail  <pty_id> --lines 50`" + ` — read recent scrollback as JSON.
-- ` + "`ab sessions kill  <pty_id>`" + ` — terminate a session.
-- ` + "`ab sessions meta  <pty_id> --label <L> [--set k=v ...]`" + ` — set the **display label** (what the user sees on the canvas).
-- ` + "`ab sessions lock <pty_id>`" + ` / ` + "`ab sessions unlock <pty_id>`" + `.
-
-## Display label vs. -name
-
-When creating a session with a **user-visible name** like "s1" / "dev1" / "test":
-
-1. Create: ` + "`ab sessions create -shell -project /tmp -name s1`" + ` → get ` + "`<pty_id>`" + `.
-2. Then **set the display label** so the canvas shows it:
-   ` + "`ab sessions meta <pty_id> --label s1`" + `
-
-Without step 2, the canvas derives the label from the cwd (e.g. ` + "`tmp-#XXXXXX`" + `) and
-ignores the internal ` + "`-name`" + `. Always run both steps when the user asked for a
-named session.
-
-## Resolving names → pty_id
-
-The user will reference sessions by their human name (e.g. "dev1", "test"),
-but all write/tail/kill commands need the opaque ` + "`pty_XXX`" + ` id. Always resolve
-via list first:
-
-` + "```" + `
-ab sessions list | jq -r '.[] | select(.name=="dev1") | .id'
-` + "```" + `
-
-If ` + "`jq`" + ` isn't available, grep the JSON and extract the ` + "`id`" + ` field.
-
-## Natural-language examples
-
-| User says                                  | You run                                                                                         |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| "create ab session test"                   | ` + "`ab sessions create -shell -project /tmp -name test`" + ` → grab id → ` + "`ab sessions meta <id> --label test`" + ` |
-| "create sessions s1, s2, s3"               | loop each name: create + meta --label                                                           |
-| "list sessions"                            | ` + "`ab sessions list`" + `                                                                     |
-| "send to dev1: …"                          | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `                                   |
-| "write to dev1: …" / "message dev1 …"      | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `  ← still send (auto-submit)        |
-| "tell dev1 to …"                           | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `                                   |
-| "ask dev1 what …"                          | resolve dev1 → ` + "`ab sessions send  <id> \"...\"`" + `                                   |
-| "draft for dev1: …" / "prefill dev1's input" / "don't submit yet" | resolve dev1 → ` + "`ab sessions write <id> \"...\"`" + ` (no Enter; user reviews manually) |
-| "tell dev1 to stop" / "cancel dev1"        | resolve dev1 → ` + "`ab sessions key  <id> ctrl-c`" + `                                        |
-| "tail dev1 last 40 lines"                  | resolve dev1 → ` + "`ab sessions tail <id> --lines 40`" + `                                   |
-| "kill test session"                        | resolve test → ` + "`ab sessions kill <id>`" + `                                                |
-| "rename session <id> to dev2"              | ` + "`ab sessions meta <id> --label dev2`" + `                                                  |
-
-## send vs write — pick the right one
-
-The user's intent matters:
-
-- **send** = fire-off. The peer agent starts working on the text right now. Use for phrases like "send to dev1 …", "tell dev2 to …", "ask dev1 …", "have dev2 do …".
-- **write** = draft / prefill. Peer sees text in the input box but nothing happens until a human presses Enter (or you run ` + "`ab sessions key <id> enter`" + ` later). Use for phrases like "draft a task for dev1 …", "prefill …", "prepare a message but let me review …".
-
-Default to **send** if unsure — it matches the natural reading of "send to X" and "tell X".
-
-## Notes
-
-- ` + "`ab`" + ` only reaches sessions on the SAME PTY daemon as yours (v1). To send to
-  a session on a different host, ask the user to configure cross-daemon peering.
-- ` + "`ab sessions write`" + ` appends Enter by default — the receiving session sees
-  exactly what a human would see after typing + pressing Return.
-- The session token is bound to YOUR session's lifetime. If your session ends,
-  the token stops working.
-`
-
-// ensureAbSkillInstalled writes the ab-pty skill into the daemon user's
-// ~/.claude/skills/ab/SKILL.md and ~/.codex/AGENTS.md if not present, or
-// refreshes them if they carry our v1 marker. User-authored files (no
-// marker) are left untouched so local customisations survive upgrades.
+// ensureAbSkillInstalled writes every entry in `installedSkills` to disk:
+//
+//   - Claude: one directory per skill at ~/.claude/skills/<name>/SKILL.md.
+//     Each skill has its own YAML `description:`, so Claude only loads what's
+//     relevant to the user's request — no bloated single-trigger doc.
+//   - Codex: a single ~/.codex/AGENTS.md that's all skills concatenated in
+//     `installedSkills` order, separated by a `\n---\n\n` divider. Codex's
+//     model is one project doc per session, not multiple skills.
+//
+// Per-file refresh logic: if the existing file carries our marker
+// (`generated-by=ab-pty`), it's safe to overwrite on next daemon start.
+// Files without the marker are user-edited and we leave them alone, so
+// host-local customisation survives daemon upgrades.
 func ensureAbSkillInstalled() {
 	usr, err := user.Current()
 	if err != nil || usr.HomeDir == "" {
 		return
 	}
-	targets := []string{
-		filepath.Join(usr.HomeDir, ".claude", "skills", "ab", "SKILL.md"),
-		filepath.Join(usr.HomeDir, ".codex", "AGENTS.md"),
+
+	// Load each skill body once (env override or embedded fallback).
+	type loaded struct {
+		name, body, source string
 	}
-	for _, p := range targets {
-		shouldWrite := true
-		if existing, err := os.ReadFile(p); err == nil {
+	loadedSkills := make([]loaded, 0, len(installedSkills))
+	for _, s := range installedSkills {
+		body, source := loadSkillBody(s.name, s.embedded)
+		loadedSkills = append(loadedSkills, loaded{name: s.name, body: body, source: source})
+	}
+
+	writeIfOurs := func(path, content string) {
+		if existing, err := os.ReadFile(path); err == nil {
 			if !strings.Contains(string(existing), abSkillMarkerV1) {
-				// User-authored, keep as is.
-				shouldWrite = false
+				return // user-authored, leave alone
 			}
 		}
-		if !shouldWrite {
-			continue
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			log.Printf("ab skill: failed to mkdir %s: %v", filepath.Dir(path), err)
+			return
 		}
-		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
-			log.Printf("ab skill: failed to mkdir %s: %v", filepath.Dir(p), err)
-			continue
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			log.Printf("ab skill: failed to write %s: %v", path, err)
+			return
 		}
-		if err := os.WriteFile(p, []byte(abSkillBody), 0644); err != nil {
-			log.Printf("ab skill: failed to write %s: %v", p, err)
-			continue
-		}
-		log.Printf("Installed ab skill: %s", p)
+		log.Printf("Installed ab skill: %s", path)
 	}
+
+	// Claude: one skill dir per entry.
+	for _, s := range loadedSkills {
+		claudePath := filepath.Join(usr.HomeDir, ".claude", "skills", s.name, "SKILL.md")
+		writeIfOurs(claudePath, s.body)
+		log.Printf("ab skill %s source: %s", s.name, s.source)
+	}
+
+	// Codex: concatenate all skills into one AGENTS.md.
+	parts := make([]string, 0, len(loadedSkills))
+	for _, s := range loadedSkills {
+		parts = append(parts, strings.TrimRight(s.body, "\n"))
+	}
+	codexBody := strings.Join(parts, "\n\n---\n\n") + "\n"
+	codexPath := filepath.Join(usr.HomeDir, ".codex", "AGENTS.md")
+	writeIfOurs(codexPath, codexBody)
 }
 
 // ensureMCPConfigured quietly ensures MCP is configured on startup
