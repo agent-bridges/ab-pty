@@ -61,7 +61,7 @@ When sending the launch line via `ab sessions send <pty> "<command>"`, use the m
 
 | Agent | Local wrapper on this host | Underlying command | Notes |
 |---|---|---|---|
-| **Claude Code** | `claudes` (preferred) | `IS_SANDBOX=1 claude --dangerously-skip-permissions` | Custom binary at `/lxd-exch/system/claudes`. Always use the wrapper, not raw `claude`. |
+| **Claude Code** | `claudes` (preferred) | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 IS_SANDBOX=1 claude --dangerously-skip-permissions` | Always use the wrapper, not raw `claude`. ⚠️ The wrapper MUST set `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` — without it Claude Code renders into the terminal alternate-screen buffer and **scroll + copy/paste break in the AB web terminal**. Canonical wrapper: `ab/scripts/claudes`. |
 | **OpenAI Codex CLI** | `codexs` (if present) or raw | `codex --full-auto` (alias `codex --yolo` in newer builds; use `codex exec --dangerously-bypass-approvals-and-sandbox` for non-TUI) | If `codexs` wrapper exists, prefer it (it'll set `CODEX_SANDBOX=danger-full-access` or equivalent). Verify with `which codexs`. |
 | **Gemini CLI** | `geminis` (if present) or raw | `gemini --yolo` (auto-approves all prompts; alternatively `--approval-mode yolo`) | If `geminis` wrapper exists, prefer it. Verify with `which geminis`. |
 | **Other / unknown** | — | Ask user for the launch line | Don't guess; ask "какой бинарь и флаг полного доступа?" |
