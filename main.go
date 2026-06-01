@@ -830,16 +830,16 @@ session). Target defaults to http://127.0.0.1:${AB_PTY_PORT:-8421}.
 
 Usage:
   ab sessions list
-  ab sessions get    <pty_id>
+  ab sessions get    <pty_id|name>
   ab sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
-  ab sessions kill   <pty_id>
-  ab sessions send   <pty_id> "text"                  # write + auto-submit (appends Enter)
-  ab sessions write  <pty_id> "text"                  # write only, DO NOT submit — user confirms
-  ab sessions key    <pty_id> <key>                   # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
-  ab sessions tail   <pty_id> [--lines N]             # alias: peek
-  ab sessions meta   <pty_id> [--label L] [--set k=v ...]
-  ab sessions lock   <pty_id>
-  ab sessions unlock <pty_id>
+  ab sessions kill   <pty_id|name>
+  ab sessions send   <pty_id|name> "text"             # write + auto-submit (appends Enter)
+  ab sessions write  <pty_id|name> "text"             # write only, DO NOT submit — user confirms
+  ab sessions key    <pty_id|name> <key>              # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
+  ab sessions tail   <pty_id|name> [--lines N]        # alias: peek
+  ab sessions meta   <pty_id|name> [--name N] [--label L] [--set k=v ...]   # --name renames the session
+  ab sessions lock   <pty_id|name>
+  ab sessions unlock <pty_id|name>
 
   ab notes list
   ab notes get    <id>
@@ -1098,12 +1098,17 @@ func runClientSessions(args []string) {
 		// print the JSON so it stays machine-parseable.
 		fmt.Println(string(out))
 	case "meta":
-		requireArg(rest, 0, "meta", "<pty_id> [--label L] [--set k=v ...]")
+		requireArg(rest, 0, "meta", "<pty_id|name> [--name N] [--label L] [--set k=v ...]")
 		target := rest[0]
 		payload := map[string]interface{}{}
 		metaSet := map[string]interface{}{}
 		for i := 1; i < len(rest); i++ {
 			switch rest[i] {
+			case "--name":
+				if i+1 < len(rest) {
+					payload["name"] = rest[i+1]
+					i++
+				}
 			case "--label":
 				if i+1 < len(rest) {
 					payload["label"] = rest[i+1]
@@ -1797,6 +1802,62 @@ func setSessionMeta(sessionID string, label *string, locked *bool, metaUpdate ma
 	return getSessionMeta(sessionID)
 }
 
+// sessionShortUID extracts the random suffix from a session ID. Format is
+// `pty_<unix-ts>_<random>` so the last underscore-segment is the short UID.
+// Used to make auto-generated session names human-readable and stable.
+func sessionShortUID(sessionID string) string {
+	idx := strings.LastIndex(sessionID, "_")
+	if idx < 0 || idx == len(sessionID)-1 {
+		return ""
+	}
+	return sessionID[idx+1:]
+}
+
+// findAliveSessionByName returns the ID of the first alive session whose
+// Name matches the argument, or "" if none. Caller already holds no lock —
+// this acquires sessionsMu.RLock briefly.
+func findAliveSessionByName(name string) string {
+	if name == "" {
+		return ""
+	}
+	sessionsMu.RLock()
+	defer sessionsMu.RUnlock()
+	for id, s := range sessions {
+		if s.Alive && s.Name == name {
+			return id
+		}
+	}
+	return ""
+}
+
+// resolvePtyTarget maps a user-provided identifier (either a `pty_<ts>_<rand>`
+// ID or a session name) to a concrete session ID. Returns the matched session
+// ID and whether a unique alive match was found. Used by CLI subcommands so
+// `ab sessions write rt-scrapper-29335 …` works alongside `ab sessions write
+// pty_1775647145_29335 …`.
+func resolvePtyTarget(arg string) (string, bool) {
+	if arg == "" {
+		return "", false
+	}
+	sessionsMu.RLock()
+	defer sessionsMu.RUnlock()
+	// Exact ID match wins immediately — it's how the daemon indexes sessions.
+	if _, ok := sessions[arg]; ok {
+		return arg, true
+	}
+	// Otherwise scan for an alive session with the matching Name.
+	var hits []string
+	for id, s := range sessions {
+		if s.Alive && s.Name == arg {
+			hits = append(hits, id)
+		}
+	}
+	if len(hits) == 1 {
+		return hits[0], true
+	}
+	return "", false
+}
+
 func expandPath(path string) string {
 	if path == "~" || len(path) > 1 && path[:2] == "~/" {
 		usr, _ := user.Current()
@@ -1890,10 +1951,34 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 		return nil, fmt.Errorf("path=%s cmd=%v: %w", projectPath, cmd.Args, err)
 	}
 
+	// Resolve the session name. Priority:
+	//   1. Explicit `-name` arg (user picked it on purpose)
+	//   2. Auto-generated `<basename(projectPath)>-<short-uid>` (last 5 digits
+	//      of sessionID's random part — gives a stable, human-readable handle
+	//      that doesn't collide with sibling sessions in the same dir).
+	// In both cases we enforce uniqueness among ALIVE sessions: a clash would
+	// make CLI name-based resolution ambiguous. On clash we add the short-uid
+	// suffix (auto path) or return an error (explicit path) — caller decides.
+	autoBase := filepath.Base(projectPath)
+	if autoBase == "" || autoBase == "." || autoBase == "/" {
+		autoBase = "root"
+	}
+	shortUID := sessionShortUID(sessionID)
 	if name == "" {
-		name = filepath.Base(projectPath)
-		if name == "" || name == "." || name == "/" {
-			name = "root"
+		name = autoBase
+		if shortUID != "" {
+			name = autoBase + "-" + shortUID
+		}
+	}
+	if existing := findAliveSessionByName(name); existing != "" && existing != sessionID {
+		// Collision among alive sessions. Auto-resolved by appending short-uid
+		// if not already present; explicit names that still collide get an
+		// error so the caller can pick a different one.
+		if shortUID != "" && !strings.HasSuffix(name, "-"+shortUID) {
+			name = name + "-" + shortUID
+		}
+		if existing := findAliveSessionByName(name); existing != "" && existing != sessionID {
+			return nil, fmt.Errorf("session name %q is already in use by %s", name, existing)
 		}
 	}
 
@@ -3431,6 +3516,13 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		sessionID = path
 	}
 
+	// Allow name-based addressing alongside the canonical pty_<ts>_<rand> id.
+	// `ab sessions write rt-scrapper-29335 …` hits this endpoint with the name
+	// in the path; resolve it to the underlying ID before routing the action.
+	if resolved, ok := resolvePtyTarget(sessionID); ok {
+		sessionID = resolved
+	}
+
 	switch {
 	case action == "lock" && r.Method == "POST":
 		locked := true
@@ -3457,8 +3549,35 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			metaUpdate = m
 		}
 
+		// Optional rename via `name`. Canonical mutable identifier — must stay
+		// unique among alive sessions so CLI name-based addressing is
+		// unambiguous. The change touches both in-memory Session.Name (used by
+		// list JSON) and the persisted meta.project_name (used by
+		// restoreSessions after a daemon restart).
+		if newName, ok := data["name"].(string); ok && newName != "" {
+			if existing := findAliveSessionByName(newName); existing != "" && existing != sessionID {
+				writeError(w, 409, fmt.Sprintf("session name %q is already in use by %s", newName, existing))
+				return
+			}
+			sessionsMu.Lock()
+			if s, ok := sessions[sessionID]; ok {
+				s.Name = newName
+			}
+			sessionsMu.Unlock()
+			if metaUpdate == nil {
+				metaUpdate = map[string]interface{}{}
+			}
+			metaUpdate["project_name"] = newName
+		}
+
 		meta := setSessionMeta(sessionID, label, nil, metaUpdate)
-		writeJSON(w, 0, map[string]interface{}{"ok": true, "label": meta.Label, "meta": meta.Meta})
+		resp := map[string]interface{}{"ok": true, "label": meta.Label, "meta": meta.Meta}
+		sessionsMu.RLock()
+		if s, ok := sessions[sessionID]; ok {
+			resp["name"] = s.Name
+		}
+		sessionsMu.RUnlock()
+		writeJSON(w, 0, resp)
 
 	case action == "stdin" && r.Method == "POST":
 		// Write raw text into a session's PTY master. Used by the in-session
@@ -4601,8 +4720,9 @@ func mcpToolResult(id interface{}, text string) string {
 	})
 }
 
-// Skills installed into Claude Code (one dir per skill) and into Codex
-// (single AGENTS.md, all skills concatenated). The marker lets the
+// Skills installed into Claude Code and Codex (one dir per skill).
+// A legacy concatenated Codex AGENTS.md is also written for older builds.
+// The marker lets the
 // daemon detect its own files and refresh them on upgrade without
 // clobbering user edits. Each skill's source is `skills/<name>.md`
 // embedded at build time; users can override per-skill by setting
@@ -4615,10 +4735,10 @@ var defaultAbSkill string
 //go:embed skills/ab-team-protocol.md
 var defaultAbTeamProtocolSkill string
 
-// skillBundle is one entry in the install set. The order in installedSkills
-// is also the concatenation order written into Codex's single AGENTS.md.
+// skillBundle is one entry in the install set. The order in installedSkills is
+// also the concatenation order written into Codex's legacy single AGENTS.md.
 type skillBundle struct {
-	name     string // dir name under ~/.claude/skills/<name>/SKILL.md
+	name     string // dir name under ~/.claude/skills and ~/.codex/skills
 	embedded string // baked-in default content
 }
 
@@ -4641,14 +4761,21 @@ func loadSkillBody(name, embedded string) (body string, source string) {
 	return embedded, "embedded"
 }
 
+func codexHomeDir(usrHome string) string {
+	if dir := strings.TrimSpace(os.Getenv("CODEX_HOME")); dir != "" {
+		return dir
+	}
+	return filepath.Join(usrHome, ".codex")
+}
+
 // ensureAbSkillInstalled writes every entry in `installedSkills` to disk:
 //
 //   - Claude: one directory per skill at ~/.claude/skills/<name>/SKILL.md.
 //     Each skill has its own YAML `description:`, so Claude only loads what's
 //     relevant to the user's request — no bloated single-trigger doc.
-//   - Codex: a single ~/.codex/AGENTS.md that's all skills concatenated in
-//     `installedSkills` order, separated by a `\n---\n\n` divider. Codex's
-//     model is one project doc per session, not multiple skills.
+//   - Codex: one directory per skill at $CODEX_HOME/skills/<name>/SKILL.md
+//     (or ~/.codex/skills when CODEX_HOME is unset). A legacy ~/.codex/AGENTS.md
+//     is still written for older Codex builds.
 //
 // Per-file refresh logic: if the existing file carries our marker
 // (`generated-by=ab-pty`), it's safe to overwrite on next daemon start.
@@ -4694,13 +4821,20 @@ func ensureAbSkillInstalled() {
 		log.Printf("ab skill %s source: %s", s.name, s.source)
 	}
 
-	// Codex: concatenate all skills into one AGENTS.md.
+	// Codex: one skill dir per entry.
+	codexHome := codexHomeDir(usr.HomeDir)
+	for _, s := range loadedSkills {
+		codexSkillPath := filepath.Join(codexHome, "skills", s.name, "SKILL.md")
+		writeIfOurs(codexSkillPath, s.body)
+	}
+
+	// Legacy Codex: concatenate all skills into one AGENTS.md.
 	parts := make([]string, 0, len(loadedSkills))
 	for _, s := range loadedSkills {
 		parts = append(parts, strings.TrimRight(s.body, "\n"))
 	}
 	codexBody := strings.Join(parts, "\n\n---\n\n") + "\n"
-	codexPath := filepath.Join(usr.HomeDir, ".codex", "AGENTS.md")
+	codexPath := filepath.Join(codexHome, "AGENTS.md")
 	writeIfOurs(codexPath, codexBody)
 }
 
