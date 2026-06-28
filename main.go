@@ -4732,20 +4732,28 @@ const abSkillMarkerV1 = "generated-by=ab-pty"
 //go:embed skills/ab.md
 var defaultAbSkill string
 
-//go:embed skills/ab-team-protocol.md
-var defaultAbTeamProtocolSkill string
-
-// skillBundle is one entry in the install set. The order in installedSkills is
-// also the concatenation order written into Codex's legacy single AGENTS.md.
+// skillBundle is one entry in the install set. The slice is kept so adding a
+// second skill later is a one-line change; with a single entry the legacy
+// Codex AGENTS.md concat below collapses to a byte copy of the body.
 type skillBundle struct {
 	name     string // dir name under ~/.claude/skills and ~/.codex/skills
 	embedded string // baked-in default content
 }
 
+// Previously also `ab-team-protocol`; merged into `ab` (2026-06-28) because
+// the two skills always loaded together in practice and the parallel Codex
+// AGENTS.md concat created a class of bugs where one half went missing on a
+// host. Old `~/.claude/skills/ab-team-protocol/` and `~/.codex/skills/
+// ab-team-protocol/` are cleaned up by removeRetiredSkills() below.
 var installedSkills = []skillBundle{
 	{name: "ab", embedded: defaultAbSkill},
-	{name: "ab-team-protocol", embedded: defaultAbTeamProtocolSkill},
 }
+
+// retiredSkills are skills we used to install but have since merged into
+// another entry. ensureAbSkillInstalled() removes their on-disk traces (only
+// the files we wrote, identified by abSkillMarkerV1) so dead skill dirs don't
+// hang around on long-lived hosts.
+var retiredSkills = []string{"ab-team-protocol"}
 
 // loadSkillBody returns the body for a skill plus the source it came from
 // (for logging). Precedence: ${AB_PTY_SKILLS_DIR}/<name>.md if set and the
@@ -4828,7 +4836,8 @@ func ensureAbSkillInstalled() {
 		writeIfOurs(codexSkillPath, s.body)
 	}
 
-	// Legacy Codex: concatenate all skills into one AGENTS.md.
+	// Legacy Codex: concatenate all skills into one AGENTS.md. With a single
+	// entry this collapses to a byte copy of the body — no separator.
 	parts := make([]string, 0, len(loadedSkills))
 	for _, s := range loadedSkills {
 		parts = append(parts, strings.TrimRight(s.body, "\n"))
@@ -4836,6 +4845,30 @@ func ensureAbSkillInstalled() {
 	codexBody := strings.Join(parts, "\n\n---\n\n") + "\n"
 	codexPath := filepath.Join(codexHome, "AGENTS.md")
 	writeIfOurs(codexPath, codexBody)
+
+	// Clean up dirs of skills we no longer install (only ours — files
+	// without the marker are user-authored and we leave them alone).
+	removeIfOurs := func(path string) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		if !strings.Contains(string(data), abSkillMarkerV1) {
+			return
+		}
+		if err := os.Remove(path); err != nil {
+			log.Printf("ab skill: failed to remove retired %s: %v", path, err)
+			return
+		}
+		// Try to drop the (now empty) parent dir. Ignore error — non-empty dirs
+		// stay, which is what we want for hand-edited siblings.
+		os.Remove(filepath.Dir(path))
+		log.Printf("Removed retired ab skill: %s", path)
+	}
+	for _, name := range retiredSkills {
+		removeIfOurs(filepath.Join(usr.HomeDir, ".claude", "skills", name, "SKILL.md"))
+		removeIfOurs(filepath.Join(codexHome, "skills", name, "SKILL.md"))
+	}
 }
 
 // ensureMCPConfigured quietly ensures MCP is configured on startup
