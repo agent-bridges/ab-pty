@@ -83,7 +83,15 @@ type Session struct {
 	Scrollback       []string
 	LastRows         int
 	LastCols         int
-	mu               sync.RWMutex
+	// BracketedPaste is the foreground app's last known bracketed-paste
+	// mode (CSI ?2004h enables, CSI ?2004l disables). Tracked by
+	// readPtyLoop scanning output. When true, `send`/`write` must wrap
+	// the payload in \x1b[200~ ... \x1b[201~ so the TUI treats the bytes
+	// as a paste; the Enter then has to follow OUTSIDE the markers as a
+	// real keypress, otherwise the \r is bundled into the paste and the
+	// message never submits (observed in Codex 0.139+, Claude Code 2.x).
+	BracketedPaste bool
+	mu             sync.RWMutex
 }
 
 // SessionMeta from DB
@@ -2267,6 +2275,17 @@ func readPtyLoop(session *Session) {
 			if len(session.Scrollback) > maxScrollback {
 				session.Scrollback = session.Scrollback[len(session.Scrollback)-maxScrollback:]
 			}
+			// Track bracketed-paste mode toggles from the foreground app.
+			// Whichever marker appears LATER in this chunk wins; if only
+			// one appears, that one wins. Used by the stdin handler to
+			// decide whether to wrap pasted payloads in \x1b[200~/\x1b[201~.
+			onIdx := strings.LastIndex(text, "\x1b[?2004h")
+			offIdx := strings.LastIndex(text, "\x1b[?2004l")
+			if onIdx > offIdx {
+				session.BracketedPaste = true
+			} else if offIdx > onIdx {
+				session.BracketedPaste = false
+			}
 			session.mu.Unlock()
 
 			broadcastToClients(session, map[string]interface{}{
@@ -3606,15 +3625,37 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		if body.Enter != nil {
 			enter = *body.Enter
 		}
-		// Write text first. Then, if enter is requested, write the Enter byte
-		// as a SEPARATE write with a small pause. TUI apps (Claude Code, Codex)
-		// that read stdin with bracketed-paste heuristics treat a single
-		// `text + \r` write as a paste — the `\r` becomes a newline inside the
-		// input box and the message never submits. Splitting the write makes
-		// the Enter look like a real key press after the typed text.
+		// Submit semantics. Two modes depending on whether the foreground
+		// TUI has bracketed-paste mode on (tracked from the output stream
+		// in readPtyLoop; Codex/Claude Code/modern shells turn it on).
+		//
+		//   bracketed=true  → wrap payload in \x1b[200~ ... \x1b[201~ so the
+		//                     TUI treats the bytes as a single PASTE event,
+		//                     then write the Enter OUTSIDE the markers as a
+		//                     real keypress. Without the markers the TUI
+		//                     bundles a `text\r` write together via its
+		//                     paste-debounce heuristic and the \r becomes a
+		//                     newline inside the input box (=hung input).
+		//                     Observed in Codex 0.139+.
+		//   bracketed=false → preserve old behaviour for plain shells (bash,
+		//                     etc.): text bytes raw, brief pause, then \r.
+		//                     Sending the CSI markers to a non-aware shell
+		//                     would inject `[200~` / `[201~` literals.
+		s.mu.RLock()
+		bracketed := s.BracketedPaste
+		s.mu.RUnlock()
+
 		total := 0
 		if payload != "" {
-			n, err := s.Pty.Write([]byte(payload))
+			var bytes []byte
+			if bracketed {
+				bytes = append(bytes, "\x1b[200~"...)
+				bytes = append(bytes, payload...)
+				bytes = append(bytes, "\x1b[201~"...)
+			} else {
+				bytes = []byte(payload)
+			}
+			n, err := s.Pty.Write(bytes)
 			if err != nil {
 				writeError(w, 500, fmt.Sprintf("Write failed: %v", err))
 				return
@@ -3622,9 +3663,14 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			total += n
 		}
 		if enter {
-			// 30ms is enough for any TUI's input debounce to treat the next
-			// write as a separate event. Tested with Claude Code / Codex / bash.
-			time.Sleep(30 * time.Millisecond)
+			// Brief pause so the TUI finishes processing the paste (or
+			// debounces a raw-byte burst) before the standalone Enter.
+			// 80ms covers Codex 0.139+; 30ms was too tight.
+			delay := 30 * time.Millisecond
+			if bracketed {
+				delay = 80 * time.Millisecond
+			}
+			time.Sleep(delay)
 			n, err := s.Pty.Write([]byte("\r"))
 			if err != nil {
 				writeError(w, 500, fmt.Sprintf("Enter-write failed: %v", err))
@@ -3632,7 +3678,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			}
 			total += n
 		}
-		writeJSON(w, 0, map[string]interface{}{"ok": true, "bytes": total})
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "bytes": total, "bracketed_paste": bracketed})
 
 	case action == "key" && r.Method == "POST":
 		// Inject a special key press (Enter, Tab, Escape, Ctrl-C, arrow keys,
