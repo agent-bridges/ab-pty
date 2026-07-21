@@ -837,7 +837,7 @@ Authenticates via $AB_PTY_SESSION_TOKEN (injected by the daemon into every
 session). Target defaults to http://127.0.0.1:${AB_PTY_PORT:-8421}.
 
 Usage:
-  ab sessions list
+  ab sessions list [--table|-t]                       # default JSON; --table = human-scan format
   ab sessions get    <pty_id|name>
   ab sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
   ab sessions kill   <pty_id|name>
@@ -1039,6 +1039,96 @@ func runClientNotes(args []string) {
 	}
 }
 
+// printSessionsTable renders `ab sessions list` output as a fixed-width
+// table. Columns: NAME, ID, ALIVE, CWD, AI. Sorted by (alive desc, name)
+// so alive sessions cluster at the top and same-prefix teams sit
+// together. NAME comes first because that's what agents pass to
+// send/write/tail. Meant for eyeballing; the JSON view (default) is
+// still the machine-readable form.
+func printSessionsTable(raw []byte) {
+	var sessions []map[string]interface{}
+	if err := json.Unmarshal(raw, &sessions); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing sessions JSON: %v\n", err)
+		fmt.Println(string(raw))
+		return
+	}
+	if len(sessions) == 0 {
+		fmt.Println("(no sessions)")
+		return
+	}
+	type row struct {
+		name, id, cwd, ai string
+		alive             bool
+	}
+	rows := make([]row, 0, len(sessions))
+	for _, s := range sessions {
+		name, _ := s["name"].(string)
+		id, _ := s["id"].(string)
+		alive, _ := s["alive"].(bool)
+		cwd, _ := s["project_path"].(string)
+		ai := ""
+		if meta, ok := s["meta"].(map[string]interface{}); ok {
+			if lc, ok := meta["last_ai_cmd"].(string); ok && lc != "" {
+				ai = lc
+				// Trim long node/absolute paths so column fits.
+				if slash := strings.LastIndex(ai, "/"); slash >= 0 && slash < len(ai)-1 {
+					ai = ai[slash+1:]
+				}
+			}
+		}
+		rows = append(rows, row{name: name, id: id, cwd: cwd, ai: ai, alive: alive})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].alive != rows[j].alive {
+			return rows[i].alive
+		}
+		return rows[i].name < rows[j].name
+	})
+
+	// Compute per-column widths against the actual data, capped so a long
+	// path can't wreck alignment.
+	max := func(a, b int) int {
+		if a > b {
+			return a
+		}
+		return b
+	}
+	nameW, idW, cwdW, aiW := len("NAME"), len("ID"), len("CWD"), len("AI")
+	for _, r := range rows {
+		nameW = max(nameW, len(r.name))
+		idW = max(idW, len(r.id))
+		cwdW = max(cwdW, len(r.cwd))
+		aiW = max(aiW, len(r.ai))
+	}
+	if cwdW > 50 {
+		cwdW = 50
+	}
+	if aiW > 20 {
+		aiW = 20
+	}
+	trunc := func(s string, w int) string {
+		if len(s) <= w {
+			return s
+		}
+		return s[:w-1] + "…"
+	}
+	fmt.Printf("%-*s  %-*s  %-5s  %-*s  %-*s\n", nameW, "NAME", idW, "ID", "ALIVE", cwdW, "CWD", aiW, "AI")
+	for _, r := range rows {
+		state := "dead"
+		if r.alive {
+			state = "alive"
+		}
+		fmt.Printf("%-*s  %-*s  %-5s  %-*s  %-*s\n",
+			nameW, r.name,
+			idW, r.id,
+			state,
+			cwdW, trunc(r.cwd, cwdW),
+			aiW, trunc(r.ai, aiW),
+		)
+	}
+	fmt.Printf("\n%d session(s)\n", len(rows))
+}
+
 func runClientSessions(args []string) {
 	if len(args) == 0 {
 		clientHelp()
@@ -1050,7 +1140,24 @@ func runClientSessions(args []string) {
 	case "list":
 		out, err := cliRequest("GET", "/api/pty", nil)
 		requireOK(err)
-		fmt.Println(string(out))
+		// Default output stays JSON so existing agent pipelines (`jq
+		// '.[] | select(.name=="…")'`) keep working. `--table` gives a
+		// scan-friendly view when a human or an LLM eyeballs the list:
+		// id, name, alive, cwd, and the last AI cmd if the daemon knows
+		// one (from meta.last_ai_cmd) — enough to distinguish sessions
+		// at a glance without a second `sessions get` round-trip.
+		wantTable := false
+		for _, a := range rest {
+			if a == "--table" || a == "-t" {
+				wantTable = true
+				break
+			}
+		}
+		if wantTable {
+			printSessionsTable(out)
+		} else {
+			fmt.Println(string(out))
+		}
 	case "get":
 		requireArg(rest, 0, "get", "<pty_id>")
 		out, err := cliRequest("GET", "/api/pty/"+rest[0], nil)
@@ -1821,6 +1928,35 @@ func sessionShortUID(sessionID string) string {
 	return sessionID[idx+1:]
 }
 
+// deriveAutoBase picks a stem for auto-generated session names. Prefers
+// the project directory's basename (e.g. "av-photo" for
+// "/lxd-exch/avito/av-photo") so agents scanning `ab sessions list` can
+// tell sessions apart from the name alone. When the path is a root-ish
+// placeholder ("/", ".", ""), falls back to the host's short name —
+// otherwise every shell opened at the filesystem root would be an
+// indistinguishable "root-XXXXX" blob in the list.
+func deriveAutoBase(projectPath string) string {
+	base := filepath.Base(projectPath)
+	if base != "" && base != "." && base != "/" {
+		return base
+	}
+	if hn, err := os.Hostname(); err == nil && hn != "" {
+		return strings.SplitN(hn, ".", 2)[0]
+	}
+	return "shell"
+}
+
+// legacyGenericNameRe matches names an older code path assigned when the
+// basename of a "/" project path was "" — literal "root", plus the
+// "root-<digits>" shape a later collision-suffix pass produced. When we
+// restore such a session and the current project_path has a real
+// basename, we discard the legacy name so the auto-namer below re-derives
+// from the path. This migrates existing sessions on the next daemon
+// restart with zero manual rename effort. User-picked names that happen
+// to include "root" as a substring (e.g. "root-fs") are unaffected —
+// the regex anchors on the whole string.
+var legacyGenericNameRe = regexp.MustCompile(`^root(-\d+)?$`)
+
 // findAliveSessionByName returns the ID of the first alive session whose
 // Name matches the argument, or "" if none. Caller already holds no lock —
 // this acquires sessionsMu.RLock briefly.
@@ -1967,10 +2103,7 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	// In both cases we enforce uniqueness among ALIVE sessions: a clash would
 	// make CLI name-based resolution ambiguous. On clash we add the short-uid
 	// suffix (auto path) or return an error (explicit path) — caller decides.
-	autoBase := filepath.Base(projectPath)
-	if autoBase == "" || autoBase == "." || autoBase == "/" {
-		autoBase = "root"
-	}
+	autoBase := deriveAutoBase(projectPath)
 	shortUID := sessionShortUID(sessionID)
 	if name == "" {
 		name = autoBase
@@ -2393,6 +2526,22 @@ func restoreSessions() {
 		}
 		if startPath == "" {
 			startPath = "~"
+		}
+
+		// Legacy-name migration: pre-fix code set project_name = "root"
+		// when basename of a "/" project_path was empty, and a later
+		// collision-suffix pass turned that into "root-<digits>".
+		// Both leave the session indistinguishable from siblings at the
+		// same cwd. If the current project_path has a real basename, drop
+		// the legacy name so createPtySession's auto-namer re-derives
+		// from the path — one-shot rewrite on the first restore under
+		// the new binary, persisted back into meta.project_name by the
+		// setSessionMeta call in createPtySession.
+		if projectName != "" && legacyGenericNameRe.MatchString(projectName) {
+			if realBase := filepath.Base(projectPath); realBase != "" && realBase != "." && realBase != "/" {
+				log.Printf("restore %s: migrating legacy name %q → derive from project_path %q", id, projectName, projectPath)
+				projectName = ""
+			}
 		}
 
 		// Restore session
