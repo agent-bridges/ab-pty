@@ -20,13 +20,40 @@ func init() {
 	initTestDB()
 }
 
+var testDBOnce sync.Once
+
+// initTestDB gives the package-level `db` handle a clean slate.
+//
+// The handle is opened exactly ONCE per test binary. It used to be
+// reopened on every call, which reassigned the global `db` while
+// readPtyLoop goroutines spawned by earlier tests were still draining —
+// those goroutines call deactivateSession, which reads `db`. `go test
+// -race` flagged the pair (initTestDB write vs deactivateSession read) as
+// a data race, and it fired in ~4 of 5 runs across a rotating cast of
+// tests, because which goroutine was mid-drain when the next test started
+// is pure timing.
+//
+// Production never reassigns `db` — initDB opens it once at startup and
+// every later access is read-only — so opening once here matches the real
+// lifecycle instead of inventing a mutation the daemon never performs.
+// Callers still get their fresh slate: the table is recreated if missing
+// and its rows are cleared on every call.
 func initTestDB() {
-	var err error
-	db, err = sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		panic(err)
-	}
-	db.Exec(`
+	testDBOnce.Do(func() {
+		var err error
+		// Shared-cache DSN, not a bare ":memory:". A plain in-memory
+		// sqlite database is scoped to a single connection, so the moment
+		// database/sql's pool opens a second one (any concurrent query
+		// does it) that query lands on an empty database with no tables —
+		// which showed up as a rare, rotating test failure rather than an
+		// obvious error. `cache=shared` with a named file: DSN gives every
+		// pooled connection the same database.
+		db, err = sql.Open("sqlite3", "file:abpty_test?mode=memory&cache=shared")
+		if err != nil {
+			panic(err)
+		}
+	})
+	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS session_meta (
 			id TEXT PRIMARY KEY,
 			label TEXT DEFAULT '',
@@ -36,7 +63,12 @@ func initTestDB() {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
-	`)
+	`); err != nil {
+		panic(err)
+	}
+	if _, err := db.Exec(`DELETE FROM session_meta`); err != nil {
+		panic(err)
+	}
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -596,8 +628,10 @@ func TestWebSocketTerminal(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if session.LastRows != 30 || session.LastCols != 100 {
-		t.Errorf("Expected size 30x100, got %dx%d", session.LastRows, session.LastCols)
+	// Read through the accessor: the resize is applied on the websocket
+	// handler's goroutine, so touching the fields directly is a data race.
+	if rows, cols := session.Winsize(); rows != 30 || cols != 100 {
+		t.Errorf("Expected size 30x100, got %dx%d", rows, cols)
 	}
 
 	// Test ping

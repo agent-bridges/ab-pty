@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -92,6 +93,52 @@ type Session struct {
 	// message never submits (observed in Codex 0.139+, Claude Code 2.x).
 	BracketedPaste bool
 	mu             sync.RWMutex
+}
+
+// IsAlive reports whether the PTY process is still running.
+//
+// Always use this instead of reading s.Alive directly. The flag is written
+// from two goroutines that do not hold sessionsMu — readPtyLoop when the
+// PTY hits EOF, and killSession on an explicit kill — while it is read
+// from every HTTP handler and from all three per-session trackers
+// (trackCwd, trackAICmd, trackClaudeSession). `go test -race` flagged the
+// unguarded pair (killSession write vs trackCwd read) as a genuine data
+// race; the accessors close it.
+//
+// Note this takes session.mu, NOT sessionsMu — the two are independent, so
+// calling IsAlive while holding sessionsMu is safe. It is NOT safe to call
+// it while already holding session.mu (RWMutex is not reentrant); read the
+// field directly in that case.
+func (s *Session) IsAlive() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Alive
+}
+
+// setAlive updates the liveness flag under session.mu. See IsAlive for why
+// the direct assignment it replaces was unsafe.
+func (s *Session) setAlive(v bool) {
+	s.mu.Lock()
+	s.Alive = v
+	s.mu.Unlock()
+}
+
+// Winsize returns the terminal's last known rows and cols, and setWinsize
+// stores them — both under session.mu. The resize path in handleWebSocket
+// used to read-compare-write these fields bare, which the race detector
+// caught against readers in other goroutines. Returning the pair together
+// also means a caller can never observe a half-updated size.
+func (s *Session) Winsize() (rows, cols int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LastRows, s.LastCols
+}
+
+func (s *Session) setWinsize(rows, cols int) {
+	s.mu.Lock()
+	s.LastRows = rows
+	s.LastCols = cols
+	s.mu.Unlock()
 }
 
 // SessionMeta from DB
@@ -243,8 +290,9 @@ var Version = "dev"
 //
 // Canonical location: /opt/ab/.jwt-secret
 // Legacy locations (still read, with warning — remove after migration):
-//   /opt/agent-bridge/.jwt-secret  (v0.1.9+)
-//   /opt/nag-daemons/.jwt-secret   (pre-v0.1.9)
+//
+//	/opt/agent-bridge/.jwt-secret  (v0.1.9+)
+//	/opt/nag-daemons/.jwt-secret   (pre-v0.1.9)
 const jwtSecretFileCanonical = "/opt/ab/.jwt-secret"
 
 var jwtSecretFileLegacy = []string{
@@ -416,7 +464,7 @@ func validateSessionToken(token string) (string, bool) {
 	sessionsMu.RLock()
 	s, ok := sessions[sessionID]
 	sessionsMu.RUnlock()
-	if !ok || !s.Alive {
+	if !ok || !s.IsAlive() {
 		return "", false
 	}
 	return sessionID, true
@@ -426,6 +474,40 @@ func validateSessionToken(token string) (string, bool) {
 // bearer token minted by deriveSessionToken. Session-token holders get the
 // same privileges as JWT holders in v1 — this matches the "the agent inside
 // a PTY can do what the AB UI user can do" spec.
+// requireLoopback rejects requests that did not originate on this host.
+//
+// Used for /api/hook, which Claude Code's hook runner POSTs to from inside
+// a PTY we spawned. Those hooks have no JWT and no session token, so the
+// endpoint cannot use sessionTokenOrJwt — but the daemon binds 0.0.0.0
+// (the AB back reaches it over the LAN or via the :8422 TLS proxy), which
+// left the handler callable by anyone who could route to port 8421. The
+// handler writes the claude_session_id→pty_id mapping that later hook
+// calls trust, so an unauthenticated remote caller could aim a session's
+// status at an arbitrary PTY. Binding the check to the peer address keeps
+// the local hook path working unchanged while closing the remote one.
+//
+// Note this trusts r.RemoteAddr, i.e. the real TCP peer. It is deliberately
+// NOT reading X-Forwarded-For: the nginx TLS terminator on :8422 forwards
+// to 127.0.0.1:8421, so honouring that header would let a remote caller
+// re-open exactly the hole this closes.
+func requireLoopback(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			// No port in RemoteAddr (unix socket, or a test's httptest
+			// transport) — treat the whole value as the host.
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			log.Printf("[hook] rejected non-loopback request from %s", r.RemoteAddr)
+			http.Error(w, "loopback only", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func sessionTokenOrJwt(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		secret := jwtCache.get()
@@ -677,6 +759,8 @@ func runListSessions() {
 	fmt.Println(strings.Repeat("-", 80))
 	for _, s := range result.Sessions {
 		alive := "no"
+		// Plain bool on the CLI's JSON-decoded struct, not a *Session —
+		// no accessor here.
 		if s.Alive {
 			alive = "yes"
 		}
@@ -959,9 +1043,15 @@ func runClientNotes(args []string) {
 		for i := 0; i < len(rest); i++ {
 			switch rest[i] {
 			case "-name", "--name":
-				if i+1 < len(rest) { label = rest[i+1]; i++ }
+				if i+1 < len(rest) {
+					label = rest[i+1]
+					i++
+				}
 			case "-content", "--content":
-				if i+1 < len(rest) { content = rest[i+1]; i++ }
+				if i+1 < len(rest) {
+					content = rest[i+1]
+					i++
+				}
 			}
 		}
 		if content == "-" {
@@ -1420,33 +1510,43 @@ Environment variables:
 	ensureHooksConfigured()
 	ensureAbSkillInstalled()
 
+	// Routes live on a private mux rather than http.DefaultServeMux. The
+	// default mux is process-global: any package linked into the binary
+	// (net/http/pprof being the classic example) can register a handler on
+	// it and silently expose an endpoint we never audited. A private mux
+	// means the route table below is the complete, reviewable surface.
+	mux := http.NewServeMux()
+
 	// Public endpoints (no auth)
-	http.HandleFunc("/info", handleInfo)
-	http.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/info", handleInfo)
+	mux.HandleFunc("/health", handleHealth)
 
 	// Protected endpoints — accept either the daemon JWT (AB UI, admin CLI)
 	// or an in-session bearer token injected into PTY env (agent-to-daemon).
-	http.HandleFunc("/api/pty", sessionTokenOrJwt(handleListPty))
-	http.HandleFunc("/api/pty/", sessionTokenOrJwt(handlePtyAPI))
-	http.HandleFunc("/api/board/items", sessionTokenOrJwt(handleBoardItems))
-	http.HandleFunc("/api/board/items/", sessionTokenOrJwt(handleBoardItems))
-	http.HandleFunc("/api/board/layouts", sessionTokenOrJwt(handleBoardLayouts))
-	http.HandleFunc("/api/board/layouts/", sessionTokenOrJwt(handleBoardLayouts))
-	http.HandleFunc("/api/projects", sessionTokenOrJwt(handleListProjects))
-	http.HandleFunc("/api/projects/", sessionTokenOrJwt(handleProjectsAPI))
-	http.HandleFunc("/api/sessions/", sessionTokenOrJwt(handleSessionsAPI))
-	http.HandleFunc("/api/fs", sessionTokenOrJwt(handleFS))
-	http.HandleFunc("/api/mkdir", sessionTokenOrJwt(handleMkdir))
-	http.HandleFunc("/api/fs/download", sessionTokenOrJwt(handleFSDownload))
-	http.HandleFunc("/api/fs/upload", sessionTokenOrJwt(handleFSUpload))
-	http.HandleFunc("/api/paste-image", sessionTokenOrJwt(handlePasteImage))
-	http.HandleFunc("/api/tunnels", sessionTokenOrJwt(handleTunnels))
-	http.HandleFunc("/api/tunnels/", sessionTokenOrJwt(handleTunnels))
-	http.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
-	http.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
+	mux.HandleFunc("/api/pty", sessionTokenOrJwt(handleListPty))
+	mux.HandleFunc("/api/pty/", sessionTokenOrJwt(handlePtyAPI))
+	mux.HandleFunc("/api/board/items", sessionTokenOrJwt(handleBoardItems))
+	mux.HandleFunc("/api/board/items/", sessionTokenOrJwt(handleBoardItems))
+	mux.HandleFunc("/api/board/layouts", sessionTokenOrJwt(handleBoardLayouts))
+	mux.HandleFunc("/api/board/layouts/", sessionTokenOrJwt(handleBoardLayouts))
+	mux.HandleFunc("/api/projects", sessionTokenOrJwt(handleListProjects))
+	mux.HandleFunc("/api/projects/", sessionTokenOrJwt(handleProjectsAPI))
+	mux.HandleFunc("/api/sessions/", sessionTokenOrJwt(handleSessionsAPI))
+	mux.HandleFunc("/api/fs", sessionTokenOrJwt(handleFS))
+	mux.HandleFunc("/api/mkdir", sessionTokenOrJwt(handleMkdir))
+	mux.HandleFunc("/api/fs/download", sessionTokenOrJwt(handleFSDownload))
+	mux.HandleFunc("/api/fs/upload", sessionTokenOrJwt(handleFSUpload))
+	mux.HandleFunc("/api/paste-image", sessionTokenOrJwt(handlePasteImage))
+	mux.HandleFunc("/api/tunnels", sessionTokenOrJwt(handleTunnels))
+	mux.HandleFunc("/api/tunnels/", sessionTokenOrJwt(handleTunnels))
+	mux.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
+	mux.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
 
-	// Hook endpoint — called by Claude Code hooks from inside PTY sessions (no JWT needed)
-	http.HandleFunc("/api/hook", handleHook)
+	// Hook endpoint — called by Claude Code hooks running inside our own
+	// PTY sessions, so it carries no JWT. requireLoopback keeps it off the
+	// network: the daemon binds 0.0.0.0 and the handler mutates the
+	// claude-session→pty mapping, which a LAN neighbour must not reach.
+	mux.HandleFunc("/api/hook", requireLoopback(handleHook))
 
 	// Periodic PTY state broadcast (processes change without events)
 	go func() {
@@ -1480,7 +1580,84 @@ Environment variables:
 		log.Fatal(err)
 	}
 
-	log.Fatal(http.Serve(ln, nil))
+	srv := &http.Server{
+		Handler: mux,
+		// Slowloris guard. A client that opens a connection and dribbles
+		// header bytes forever used to pin a goroutine for the life of the
+		// process, because http.Serve's zero-value timeouts are infinite.
+		ReadHeaderTimeout: 20 * time.Second,
+		// Reap idle keep-alive connections. Does not apply to hijacked
+		// (websocket) connections.
+		IdleTimeout: 120 * time.Second,
+		// 1 MiB of headers is already absurd for this API.
+		MaxHeaderBytes: 1 << 20,
+
+		// Deliberately NOT setting ReadTimeout / WriteTimeout: they are
+		// absolute deadlines on the underlying net.Conn and survive the
+		// hijack that gorilla/websocket performs on /ws and /ws/pty-state.
+		// Setting either would tear down every terminal websocket on a
+		// fixed timer regardless of activity. ReadHeaderTimeout covers the
+		// pre-hijack window, which is the part that needs a bound; the
+		// long-lived phase is policed by the websocket ping/pong loop.
+	}
+
+	// Graceful shutdown. systemd sends SIGTERM on `systemctl restart`; the
+	// old code took the default action and died mid-write, so websocket
+	// clients saw a truncated stream instead of a close frame and any
+	// session_meta update still in flight was lost. Drain instead.
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			serveErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serveErr:
+		log.Fatal(err)
+	case sig := <-shutdown:
+		log.Printf("received %s — shutting down", sig)
+		// PTY processes are intentionally left running: they are
+		// re-adopted on the next start by restoreSessions, which is the
+		// whole point of session_meta.active. We only need to stop
+		// accepting work and let in-flight HTTP handlers finish.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown timed out: %v", err)
+		}
+		closePtySubscribers()
+		if db != nil {
+			if err := db.Close(); err != nil {
+				log.Printf("closing database: %v", err)
+			}
+		}
+		log.Printf("shutdown complete")
+	}
+}
+
+// closePtySubscribers sends a websocket close frame to every state
+// subscriber so browsers see a clean disconnect (and reconnect promptly)
+// instead of a dangling socket that only fails on the next write.
+func closePtySubscribers() {
+	subsMu.RLock()
+	conns := make([]*SafeConn, 0, len(ptySubscribers))
+	for c := range ptySubscribers {
+		conns = append(conns, c)
+	}
+	subsMu.RUnlock()
+
+	msg := websocket.FormatCloseMessage(websocket.CloseGoingAway, "daemon shutting down")
+	for _, c := range conns {
+		c.WriteMessage(websocket.CloseMessage, msg)
+		c.Close()
+	}
+	if len(conns) > 0 {
+		log.Printf("closed %d pty-state subscriber(s)", len(conns))
+	}
 }
 
 func initDB() {
@@ -1610,16 +1787,16 @@ func initDB() {
 }
 
 type BoardItemRecord struct {
-	ID          string   `json:"id"`
-	Type        string   `json:"type"`
-	Label       string   `json:"label"`
-	PtyID       string   `json:"ptyId,omitempty"`
-	NoteContent string   `json:"noteContent,omitempty"`
-	CurrentPath string   `json:"currentPath,omitempty"`
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Label       string `json:"label"`
+	PtyID       string `json:"ptyId,omitempty"`
+	NoteContent string `json:"noteContent,omitempty"`
+	CurrentPath string `json:"currentPath,omitempty"`
 	// Free-form labels for IDE-mode organization. One item can have many
 	// tags; sidebar groups items by distinct tag name. Always serialised as
 	// a JSON array — never null — so the front can rely on the field.
-	Tags        []string `json:"tags"`
+	Tags []string `json:"tags"`
 }
 
 type BoardLayoutRecord struct {
@@ -1967,7 +2144,7 @@ func findAliveSessionByName(name string) string {
 	sessionsMu.RLock()
 	defer sessionsMu.RUnlock()
 	for id, s := range sessions {
-		if s.Alive && s.Name == name {
+		if s.IsAlive() && s.Name == name {
 			return id
 		}
 	}
@@ -1992,7 +2169,7 @@ func resolvePtyTarget(arg string) (string, bool) {
 	// Otherwise scan for an alive session with the matching Name.
 	var hits []string
 	for id, s := range sessions {
-		if s.Alive && s.Name == arg {
+		if s.IsAlive() && s.Name == arg {
 			hits = append(hits, id)
 		}
 	}
@@ -2201,7 +2378,7 @@ func trackAICmd(session *Session) {
 	defer ticker.Stop()
 	for {
 		<-ticker.C
-		if !session.Alive {
+		if !session.IsAlive() {
 			return
 		}
 		if session.Cmd == nil || session.Cmd.Process == nil {
@@ -2251,9 +2428,9 @@ func trackCwd(session *Session) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	for session.Alive {
+	for session.IsAlive() {
 		<-ticker.C
-		if !session.Alive || session.Cmd == nil || session.Cmd.Process == nil {
+		if !session.IsAlive() || session.Cmd == nil || session.Cmd.Process == nil {
 			return
 		}
 
@@ -2321,11 +2498,11 @@ func trackClaudeSession(session *Session) {
 	attempts := 0
 	maxAttempts := 15
 
-	for session.Alive && attempts < maxAttempts {
+	for session.IsAlive() && attempts < maxAttempts {
 		<-ticker.C
 		attempts++
 
-		if !session.Alive {
+		if !session.IsAlive() {
 			return
 		}
 
@@ -2388,7 +2565,7 @@ func trackClaudeSession(session *Session) {
 
 func readPtyLoop(session *Session) {
 	buf := make([]byte, 8192)
-	for session.Alive {
+	for session.IsAlive() {
 		n, err := session.Pty.Read(buf)
 		if err != nil {
 			if err != io.EOF {
@@ -2428,7 +2605,7 @@ func readPtyLoop(session *Session) {
 		}
 	}
 
-	session.Alive = false
+	session.setAlive(false)
 	deactivateSession(session.ID)
 	broadcastToClients(session, map[string]interface{}{"type": "session_ended"})
 	broadcastPtyState()
@@ -2461,7 +2638,7 @@ func killSession(sessionID string) {
 	delete(sessions, sessionID)
 	sessionsMu.Unlock()
 
-	session.Alive = false
+	session.setAlive(false)
 	if session.Cmd != nil && session.Cmd.Process != nil {
 		session.Cmd.Process.Kill()
 		session.Cmd.Wait()
@@ -2589,7 +2766,7 @@ func restoreSessions() {
 // for the login shell to reach its prompt before writing.
 func relaunchAICmd(session *Session, aiCmd string) {
 	time.Sleep(2 * time.Second)
-	if !session.Alive || session.Pty == nil {
+	if !session.IsAlive() || session.Pty == nil {
 		return
 	}
 	if _, err := session.Pty.Write([]byte(aiCmd + "\n")); err != nil {
@@ -2674,7 +2851,7 @@ func broadcastPtyState() {
 
 		// Collect child processes if session is alive
 		var processes []ProcessInfo
-		if s.Alive && s.Cmd != nil && s.Cmd.Process != nil {
+		if s.IsAlive() && s.Cmd != nil && s.Cmd.Process != nil {
 			processes = getChildProcesses(s.Cmd.Process.Pid)
 		}
 		if processes == nil {
@@ -2727,7 +2904,7 @@ func broadcastPtyState() {
 			"project_name":      projectName,
 			"created_at":        s.CreatedAt.Format(time.RFC3339),
 			"clients":           clientCount,
-			"alive":             s.Alive,
+			"alive":             s.IsAlive(),
 			"type":              sessionType,
 			"locked":            locked,
 			"label":             label,
@@ -3278,7 +3455,7 @@ func handleListProjects(w http.ResponseWriter, r *http.Request) {
 	sessionsMu.RLock()
 	ptyByPath := make(map[string][]string)
 	for _, s := range sessions {
-		if s.Alive {
+		if s.IsAlive() {
 			ptyByPath[s.ProjectPath] = append(ptyByPath[s.ProjectPath], s.ID)
 		}
 	}
@@ -3645,7 +3822,7 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 			"created_at":      s.CreatedAt.Format(time.RFC3339),
 			"clients":         clientCount,
 			"scrollback_size": scrollbackSize,
-			"alive":           s.Alive,
+			"alive":           s.IsAlive(),
 			"type":            sessionType,
 			"locked":          locked,
 			"label":           label,
@@ -3757,7 +3934,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 404, "Session not found")
 			return
 		}
-		if !s.Alive {
+		if !s.IsAlive() {
 			writeError(w, 409, "Session is not alive")
 			return
 		}
@@ -3840,7 +4017,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 404, "Session not found")
 			return
 		}
-		if !s.Alive {
+		if !s.IsAlive() {
 			writeError(w, 409, "Session is not alive")
 			return
 		}
@@ -4310,7 +4487,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if !s.Alive {
+		if !s.IsAlive() {
 			conn.WriteJSON(map[string]string{"type": "error", "message": "PTY session is dead"})
 			return
 		}
@@ -4399,7 +4576,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			conn.WriteJSON(map[string]string{"type": "pong"})
 
 		case "input":
-			if !session.Alive {
+			if !session.IsAlive() {
 				conn.WriteJSON(map[string]string{"type": "session_ended"})
 				return
 			}
@@ -4412,12 +4589,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			go broadcastPtyState()
 
 		case "resize":
-			newRows := int(getFloat(data, "rows", float64(session.LastRows)))
-			newCols := int(getFloat(data, "cols", float64(session.LastCols)))
+			// Winsize lives on the Session and is written from whichever
+			// websocket goroutine owns this terminal, while readers sit in
+			// other goroutines (restore paths, tests). Take session.mu for
+			// the read-compare-write so two clients resizing at once can't
+			// interleave into a mismatched rows/cols pair.
+			curRows, curCols := session.Winsize()
+			newRows := int(getFloat(data, "rows", float64(curRows)))
+			newCols := int(getFloat(data, "cols", float64(curCols)))
 
-			if newRows != session.LastRows || newCols != session.LastCols {
-				session.LastRows = newRows
-				session.LastCols = newCols
+			if newRows != curRows || newCols != curCols {
+				session.setWinsize(newRows, newCols)
 				setWinsize(session.Pty, newRows, newCols)
 
 				if !pendingScrollback {
@@ -5531,7 +5713,7 @@ func findPtyByClaudeProcess(claudeSessionID string) string {
 	aiCount := 0
 
 	for _, s := range sessions {
-		if !s.Alive || s.Cmd == nil || s.Cmd.Process == nil {
+		if !s.IsAlive() || s.Cmd == nil || s.Cmd.Process == nil {
 			continue
 		}
 		pid := s.Cmd.Process.Pid
@@ -5740,9 +5922,9 @@ func handleTunnels(w http.ResponseWriter, r *http.Request) {
 		// Re-list to return the canonical state (PID may have changed).
 		listOut, _ := runTu("ls")
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"installed":   true,
-			"tunnels":     parseTuLs(listOut),
-			"create_log":  out,
+			"installed":  true,
+			"tunnels":    parseTuLs(listOut),
+			"create_log": out,
 		})
 
 	case http.MethodDelete:
@@ -5771,9 +5953,9 @@ func handleTunnels(w http.ResponseWriter, r *http.Request) {
 		}
 		listOut, _ := runTu("ls")
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"installed":  true,
-			"tunnels":    parseTuLs(listOut),
-			"kill_log":   out,
+			"installed": true,
+			"tunnels":   parseTuLs(listOut),
+			"kill_log":  out,
 		})
 
 	default:
