@@ -293,6 +293,13 @@ var Version = "dev"
 //
 //	/opt/agent-bridge/.jwt-secret  (v0.1.9+)
 //	/opt/nag-daemons/.jwt-secret   (pre-v0.1.9)
+//
+// AB_PTY_JWT_SECRET_PATH (see jwtSecretPathEnv below) overrides all of the
+// above: when set, the secret is read only from that exact path, with no
+// canonical/legacy fallback. This is for installs that have no /opt access
+// at all (e.g. a non-canonical dev stand under $HOME) rather than for a
+// deployment migrating off a legacy path — those should keep using the
+// canonical /opt/ab layout.
 const jwtSecretFileCanonical = "/opt/ab/.jwt-secret"
 
 var jwtSecretFileLegacy = []string{
@@ -304,6 +311,7 @@ var jwtSecretFileLegacy = []string{
 var jwtSecretFile = jwtSecretFileCanonical
 
 const allowedOriginsEnv = "AB_PTY_ALLOWED_ORIGINS"
+const jwtSecretPathEnv = "AB_PTY_JWT_SECRET_PATH"
 
 type jwtSecretCache struct {
 	mu       sync.RWMutex
@@ -359,8 +367,17 @@ func (c *jwtSecretCache) get() string {
 		return c.secret
 	}
 
-	// Try canonical path first, then each legacy path with a deprecation warning.
-	paths := append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
+	// AB_PTY_JWT_SECRET_PATH pins the secret to one explicit path — no
+	// canonical/legacy fallback — for non-canonical installs (no /opt
+	// access). Otherwise: canonical path first, then each legacy path with
+	// a deprecation warning.
+	envPath := strings.TrimSpace(os.Getenv(jwtSecretPathEnv))
+	var paths []string
+	if envPath != "" {
+		paths = []string{envPath}
+	} else {
+		paths = append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
+	}
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -372,9 +389,12 @@ func (c *jwtSecretCache) get() string {
 		}
 		c.secret = secret
 		c.lastLoad = time.Now()
-		if p == jwtSecretFileCanonical {
+		switch {
+		case envPath != "":
+			log.Printf("JWT secret loaded from %s (%s)", p, jwtSecretPathEnv)
+		case p == jwtSecretFileCanonical:
 			log.Printf("JWT secret loaded from %s", p)
-		} else {
+		default:
 			log.Printf("WARN: JWT secret loaded from legacy path %s — migrate to %s", p, jwtSecretFileCanonical)
 		}
 		return c.secret
@@ -1447,10 +1467,11 @@ Utilities:
   help        Show this help
 
 Environment variables:
-  AB_PTY_PORT            Server port (default: 8421)
-  AB_PTY_DATABASE        SQLite database path (default: /opt/ab/data/sessions.db)
-  AB_PTY_SESSION_ID      (set by daemon in each PTY) caller session id
-  AB_PTY_SESSION_TOKEN   (set by daemon in each PTY) bearer for /api/pty/* calls
+  AB_PTY_PORT              Server port (default: 8421)
+  AB_PTY_DATABASE          SQLite database path (default: /opt/ab/data/sessions.db)
+  AB_PTY_JWT_SECRET_PATH   JWT secret file path (default: /opt/ab/.jwt-secret, then legacy paths)
+  AB_PTY_SESSION_ID        (set by daemon in each PTY) caller session id
+  AB_PTY_SESSION_TOKEN     (set by daemon in each PTY) bearer for /api/pty/* calls
 `, Version)
 			return
 		case "list":
