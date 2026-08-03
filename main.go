@@ -38,6 +38,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sys/unix"
 )
 
 // SafeConn wraps websocket.Conn with a mutex for safe concurrent writes
@@ -1580,14 +1581,17 @@ Environment variables:
 
 	log.Printf("AB-PTY starting on :%s", port)
 
-	// Create listener with SO_REUSEPORT for graceful restart
-	// SO_REUSEPORT = 15 on Linux
-	const SO_REUSEPORT = 15
+	// Create listener with SO_REUSEPORT for graceful restart.
+	// The option number differs per OS (15 on Linux, 0x200 on Darwin) — a
+	// hardcoded Linux value here used to make the daemon fail to listen at
+	// all on macOS with "protocol not available". x/sys/unix.SO_REUSEPORT
+	// resolves to the correct value for whichever OS this binary is built
+	// for.
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var opErr error
 			err := c.Control(func(fd uintptr) {
-				opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, SO_REUSEPORT, 1)
+				opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 			})
 			if err != nil {
 				return err
