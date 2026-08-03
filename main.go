@@ -314,6 +314,17 @@ var jwtSecretFile = jwtSecretFileCanonical
 const allowedOriginsEnv = "AB_PTY_ALLOWED_ORIGINS"
 const jwtSecretPathEnv = "AB_PTY_JWT_SECRET_PATH"
 
+// jwtSecretSearchPaths returns the ordered list of paths to try when loading
+// the JWT secret. Shared by jwtSecretCache.get() (daemon) and getLocalJWT()
+// (CLI helper) so the AB_PTY_JWT_SECRET_PATH override behaves identically
+// in both places.
+func jwtSecretSearchPaths() []string {
+	if envPath := strings.TrimSpace(os.Getenv(jwtSecretPathEnv)); envPath != "" {
+		return []string{envPath}
+	}
+	return append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
+}
+
 type jwtSecretCache struct {
 	mu       sync.RWMutex
 	secret   string
@@ -373,12 +384,7 @@ func (c *jwtSecretCache) get() string {
 	// access). Otherwise: canonical path first, then each legacy path with
 	// a deprecation warning.
 	envPath := strings.TrimSpace(os.Getenv(jwtSecretPathEnv))
-	var paths []string
-	if envPath != "" {
-		paths = []string{envPath}
-	} else {
-		paths = append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
-	}
+	paths := jwtSecretSearchPaths()
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -671,8 +677,9 @@ func parseExpiry(s string) time.Duration {
 
 // CLI helper: get local JWT token
 func getLocalJWT() string {
-	// Try canonical path first, then the same legacy paths the daemon reads.
-	paths := append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
+	// Same search order (and AB_PTY_JWT_SECRET_PATH override) as the
+	// daemon's own jwtSecretCache.get() — see jwtSecretSearchPaths.
+	paths := jwtSecretSearchPaths()
 	var secret string
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
