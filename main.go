@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"database/sql"
 	_ "embed"
 	"encoding/base64"
@@ -710,7 +711,15 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 	if port == "" {
 		port = "8421"
 	}
-	url := fmt.Sprintf("http://localhost:%s%s", port, path)
+	// The daemon may be serving TLS (AB_PTY_TLS_MODE != off). Its certificate
+	// is self-signed by design, so loopback calls skip verification — this is
+	// a same-host call to a socket we already trust, and the real auth is the
+	// bearer token below.
+	scheme := "http"
+	if tlsMode() != TLSModeOff {
+		scheme = "https"
+	}
+	url := fmt.Sprintf("%s://localhost:%s%s", scheme, port, path)
 
 	var req *http.Request
 	var err error
@@ -734,6 +743,9 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 10 * time.Second}
+	if scheme == "https" {
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("daemon not running? %v", err)
@@ -1000,6 +1012,13 @@ func runClient(args []string) {
 		runClientSessions(args[1:])
 	case "notes":
 		runClientNotes(args[1:])
+	case "add", "list", "revoke":
+		// mTLS client allow-list. `ab-pty client add|list|revoke` is the
+		// documented spelling (it reads as "manage clients"); it shares the
+		// `client` namespace with the in-session API CLI above, which only
+		// ever uses the `sessions` / `notes` verbs, so there is no clash.
+		// `ab-pty tls client ...` is the equivalent long form.
+		runTLSClient(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown client subcommand: %s\n", args[0])
 		clientHelp()
@@ -1470,6 +1489,10 @@ In-session API client (for use INSIDE a PTY session — auth from env):
 Utilities:
   version     Show version
   genjwt      Generate JWT token (use -h for options)
+  tls         Native TLS / mutual TLS (init, status, fingerprint, client)
+  client add <name> <sha256>    Authorize a client certificate (mTLS allow-list)
+  client list                   List authorized client certificates
+  client revoke <name>          Revoke one (takes effect immediately)
   mcp         Run in MCP mode
   setup-mcp   Setup MCP config in claude_desktop_config.json
   help        Show this help
@@ -1480,6 +1503,30 @@ Environment variables:
   AB_PTY_JWT_SECRET_PATH   JWT secret file path (default: /opt/ab/.jwt-secret, then legacy paths)
   AB_PTY_SESSION_ID        (set by daemon in each PTY) caller session id
   AB_PTY_SESSION_TOKEN     (set by daemon in each PTY) bearer for /api/pty/* calls
+
+TLS (all opt-in; the default is plain HTTP, exactly as before):
+  AB_PTY_TLS_MODE          off (default) | optional | required
+                           off      — plain HTTP, no certificates touched.
+                           optional — HTTPS; a client certificate is requested
+                                      but not required. Enrolment mode: the app
+                                      connects without a key so its fingerprint
+                                      can be registered.
+                           required — HTTPS; the client must present a
+                                      certificate whose SHA-256 fingerprint is
+                                      in the allow-list, or the TLS handshake
+                                      is aborted before any HTTP is served.
+  AB_PTY_TLS_CERT          Server certificate (default: <jwt-secret-dir>/tls/server.crt)
+  AB_PTY_TLS_KEY           Server key         (default: <jwt-secret-dir>/tls/server.key)
+  AB_PTY_TLS_ALLOW_LOOPBACK  1 = connections from 127.0.0.1/::1 may skip the
+                           client certificate even in required mode (keeps the
+                           in-session 'ab' CLI and /api/hook working). Default 0.
+
+Setup:
+  ab-pty tls init                        # generate the server keypair (SANs
+                                         # cover localhost, 127.0.0.1, ::1, the
+                                         # hostname and every interface IP)
+  ab-pty client add phone <sha256>       # authorize a client certificate
+  AB_PTY_TLS_MODE=required ab-pty        # run locked down
 `, Version)
 			return
 		case "list":
@@ -1509,6 +1556,9 @@ Environment variables:
 			return
 		case "client":
 			runClient(os.Args[2:])
+			return
+		case "tls":
+			runTLS(os.Args[2:])
 			return
 		}
 	}
@@ -1610,6 +1660,27 @@ Environment variables:
 	ln, err := lc.Listen(context.Background(), "tcp", ":"+port)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Native TLS. Default AB_PTY_TLS_MODE=off leaves `ln` untouched — the
+	// listener stays plain HTTP, byte-for-byte the pre-mTLS behaviour.
+	if mode := tlsMode(); mode != TLSModeOff {
+		tlsCfg, terr := buildTLSConfig(mode)
+		if terr != nil {
+			log.Fatal(terr)
+		}
+		ln = tls.NewListener(ln, tlsCfg)
+		log.Printf("TLS enabled: mode=%s cert=%s sha256=%s", mode, tlsCertPath(), prettyFingerprint(tlsServerFingerprint))
+		if mode == TLSModeRequired {
+			n := 0
+			if clients, cerr := listAuthorizedClients(); cerr == nil {
+				n = len(clients)
+			}
+			log.Printf("TLS client auth: required, %d authorized certificate(s); loopback exempt=%v", n, tlsAllowLoopback())
+			if n == 0 {
+				log.Printf("WARN: mode=required with an empty allow-list — every client will be rejected. Add one: ab-pty client add <name> <sha256>")
+			}
+		}
 	}
 
 	srv := &http.Server{
@@ -1816,6 +1887,11 @@ func initDB() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Mutual-TLS client allow-list (see mtls.go). Created unconditionally,
+	// including in AB_PTY_TLS_MODE=off installs, so `ab-pty client list`
+	// answers on a daemon that has never had TLS switched on.
+	initTLSClientsTable()
 }
 
 type BoardItemRecord struct {
@@ -2289,6 +2365,11 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 			"AB_PTY_SESSION_ID="+sessionID,
 			"AB_PTY_SESSION_TOKEN="+tok,
 		)
+	}
+	// The in-session CLI builds its own URL — it needs the scheme, not just
+	// the port, or it will speak plain HTTP to a TLS listener.
+	if m := tlsMode(); m != TLSModeOff {
+		cmd.Env = append(cmd.Env, tlsModeEnv+"="+m)
 	}
 	// Expose the daemon's listening port so the CLI default target is correct.
 	if port := os.Getenv("AB_PTY_PORT"); port != "" {
@@ -3708,12 +3789,31 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 		port = "8421"
 	}
 
-	writeJSON(w, 0, map[string]interface{}{
+	// TLS state is deliberately public: the client needs to know which mode
+	// the daemon is in *before* it can authenticate (in `optional` it has no
+	// certificate yet), and a server certificate fingerprint is not a secret —
+	// every peer already sees the whole certificate during the handshake.
+	info := map[string]interface{}{
 		"version":  Version,
 		"hostname": hostname,
 		"sessions": sessionCount,
 		"port":     port,
-	})
+		"tls_mode": tlsMode(),
+	}
+	if tlsServerFingerprint != "" {
+		info["tls_server_fingerprint"] = tlsServerFingerprint
+	}
+	// Present only over TLS: tells the caller whether the certificate it just
+	// presented is on the allow-list, which is how the app distinguishes
+	// "enrolled" from "tolerated because the daemon is in optional mode".
+	if r.TLS != nil {
+		info["tls_client_authorized"] = false
+		if name := tlsPeerName(r); name != "" {
+			info["tls_client_authorized"] = true
+			info["tls_client_name"] = name
+		}
+	}
+	writeJSON(w, 0, info)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
