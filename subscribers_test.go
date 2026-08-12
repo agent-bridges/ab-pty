@@ -86,44 +86,59 @@ func TestSlowSubscriberDoesNotStallOthers(t *testing.T) {
 	registerStateSub(fast)
 	defer fast.stop("test cleanup")
 
-	// More frames than one subscriber's buffer can hold, so the stalled peer
-	// is not merely slow but hopeless.
-	frames := stateSubBuffer + 10
-	done := make(chan struct{})
+	// The property under test: the healthy subscriber keeps receiving while
+	// the other one is wedged mid-write. Before the per-subscriber pump this
+	// blocked forever on the first frame.
+	const firstBurst = 5
+	sent := make(chan struct{})
 	go func() {
-		for i := 0; i < frames; i++ {
+		for i := 0; i < firstBurst; i++ {
 			broadcastBoardItemsChanged()
 		}
-		close(done)
+		close(sent)
 	}()
-
 	select {
-	case <-done:
+	case <-sent:
 	case <-time.After(5 * time.Second):
 		t.Fatal("broadcast blocked on the stalled subscriber")
 	}
-
-	// The healthy subscriber must have received every frame.
-	for i := 0; i < frames; i++ {
+	for i := 0; i < firstBurst; i++ {
 		select {
 		case <-fastConn.got:
 		case <-time.After(5 * time.Second):
-			t.Fatalf("fast subscriber only received %d of %d frames", i, frames)
+			t.Fatalf("fast subscriber received only %d of %d frames while another was stalled", i, firstBurst)
 		}
 	}
 
-	// And the stalled one must have been dropped and closed, so it stops
-	// counting as a live subscriber.
+	// Keep going past the stalled subscriber's queue depth: it must be
+	// dropped rather than buffered forever. The healthy one is drained
+	// concurrently, as a real socket would be.
+	stopDrain := make(chan struct{})
+	defer close(stopDrain)
+	go func() {
+		for {
+			select {
+			case <-fastConn.got:
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+	for i := 0; i < stateSubBuffer+10; i++ {
+		broadcastBoardItemsChanged()
+		time.Sleep(time.Millisecond)
+	}
+
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		subsMu.RLock()
-		_, still := ptySubscribers[slow]
-		n := len(ptySubscribers)
+		_, stillSlow := ptySubscribers[slow]
+		_, stillFast := ptySubscribers[fast]
 		subsMu.RUnlock()
-		if !still {
-			if n != 1 {
-				t.Fatalf("expected exactly the healthy subscriber to remain, got %d", n)
-			}
+		if !stillFast {
+			t.Fatal("the healthy subscriber was dropped")
+		}
+		if !stillSlow {
 			break
 		}
 		if time.Now().After(deadline) {
