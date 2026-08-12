@@ -67,7 +67,15 @@ func relayEnabled() bool {
 // in-session CLI and then turns on the relay would have every reason to
 // believe the two are unrelated, and no way to notice if they were not.
 func validateRelayConfig() error {
-	if relayEnabled() && tlsAllowLoopback() {
+	return validateRelayActive(relayEnabled())
+}
+
+// validateRelayActive is the same check with the "is the relay on" answer
+// supplied by the caller. It exists because the relay can also be switched on
+// by `ab-pty relay connect`, which stores its answer in SQLite — so the check
+// has to run a second time once the database is open.
+func validateRelayActive(active bool) error {
+	if active && tlsAllowLoopback() {
 		return fmt.Errorf(
 			"%s=1 is incompatible with %s=1: the relay carries connections from an untrusted network, "+
 				"and a loopback exemption must never be one bug away from applying to them. "+

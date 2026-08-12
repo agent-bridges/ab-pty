@@ -1550,6 +1550,8 @@ Utilities:
   version     Show version
   genjwt      Generate JWT token (use -h for options)
   tls         Native TLS / mutual TLS (init, status, fingerprint, client)
+  relay       Reach this daemon from anywhere through an ab-relay
+              (connect, status, disconnect, id)
   client add <name> <sha256>    Authorize a client certificate (mTLS allow-list)
   client list                   List authorized client certificates
   client revoke <name>          Revoke one (takes effect immediately)
@@ -1620,6 +1622,9 @@ Setup:
 		case "tls":
 			runTLS(os.Args[2:])
 			return
+		case "relay":
+			runRelay(os.Args[2:])
+			return
 		}
 	}
 
@@ -1649,6 +1654,17 @@ Setup:
 	}
 
 	initDB()
+
+	// The relay can also be switched on by `ab-pty relay connect`, whose
+	// answer lives in SQLite and is therefore only knowable now. Re-run the
+	// safety check with that included: the loopback exemption must never be
+	// reachable from a connection that came in off the internet, however the
+	// relay was turned on.
+	relayWanted := relayEnabled() || relayConfiguredEnabled()
+	if err := validateRelayActive(relayWanted); err != nil {
+		log.Fatal(err)
+	}
+
 	restoreSessions()
 	cleanupStaleBoardItems()
 	initProjectsIndexer()
@@ -1739,12 +1755,17 @@ Setup:
 	// has no tunnel feeding it yet; when the ssh side lands it delivers its
 	// channels to exactly this listener, and inherits this mux and a
 	// required-mTLS config without a second authentication path existing.
-	if relayEnabled() {
+	//
+	// The listener is created when the relay is switched on either by the
+	// environment or by `ab-pty relay connect` (stored in SQLite), and the
+	// manager in relayclient.go is what dials out and feeds it.
+	if relayWanted {
 		ln, rerr := serveRelay(srv)
 		if rerr != nil {
 			log.Fatal(rerr)
 		}
 		relayLn = ln
+		startRelayManager(ln)
 	}
 
 	// Graceful shutdown. systemd sends SIGTERM on `systemctl restart`; the
@@ -1933,6 +1954,10 @@ func initDB() {
 	// including in AB_PTY_TLS_MODE=off installs, so `ab-pty client list`
 	// answers on a daemon that has never had TLS switched on.
 	initTLSClientsTable()
+
+	// Relay configuration (see relayclient.go). Same reasoning: created
+	// unconditionally so `ab-pty relay status` answers everywhere.
+	initRelayTable()
 }
 
 type BoardItemRecord struct {
