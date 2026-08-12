@@ -502,9 +502,7 @@ func TestWebSocketPtyState(t *testing.T) {
 	sessions = make(map[string]*Session)
 	sessionsMu.Unlock()
 
-	subsMu.Lock()
-	ptySubscribers = make(map[*SafeConn]bool)
-	subsMu.Unlock()
+	resetStateSubs()
 
 	// Create test server
 	server := httptest.NewServer(http.HandlerFunc(handlePtyState))

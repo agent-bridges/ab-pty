@@ -48,15 +48,21 @@ type SafeConn struct {
 	mu   sync.Mutex
 }
 
+// WriteMessage writes under a deadline. gorilla/websocket with no write
+// deadline blocks until the TCP window opens, i.e. potentially forever if the
+// peer is gone-but-not-closed; that is how one dead client used to pin a
+// broadcast goroutine for the life of the process.
 func (sc *SafeConn) WriteMessage(messageType int, data []byte) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 	return sc.conn.WriteMessage(messageType, data)
 }
 
 func (sc *SafeConn) WriteJSON(v interface{}) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 	return sc.conn.WriteJSON(v)
 }
 
@@ -156,7 +162,7 @@ type SessionMeta struct {
 var (
 	sessions       = make(map[string]*Session)
 	sessionsMu     sync.RWMutex
-	ptySubscribers = make(map[*SafeConn]bool)
+	ptySubscribers = make(map[*stateSub]bool)
 	subsMu         sync.RWMutex
 	db             *sql.DB
 	upgrader       = websocket.Upgrader{
@@ -1746,20 +1752,18 @@ Setup:
 // subscriber so browsers see a clean disconnect (and reconnect promptly)
 // instead of a dangling socket that only fails on the next write.
 func closePtySubscribers() {
-	subsMu.RLock()
-	conns := make([]*SafeConn, 0, len(ptySubscribers))
-	for c := range ptySubscribers {
-		conns = append(conns, c)
-	}
-	subsMu.RUnlock()
+	subs := snapshotStateSubs()
 
 	msg := websocket.FormatCloseMessage(websocket.CloseGoingAway, "daemon shutting down")
-	for _, c := range conns {
-		c.WriteMessage(websocket.CloseMessage, msg)
-		c.Close()
+	for _, s := range subs {
+		// Straight to the connection: the pump may already be parked on a
+		// write, and a close frame that waits its turn is a close frame
+		// nobody sees.
+		s.conn.WriteMessage(websocket.CloseMessage, msg)
+		s.stop("daemon shutting down")
 	}
-	if len(conns) > 0 {
-		log.Printf("closed %d pty-state subscriber(s)", len(conns))
+	if len(subs) > 0 {
+		log.Printf("closed %d pty-state subscriber(s)", len(subs))
 	}
 }
 
@@ -3033,18 +3037,9 @@ func broadcastPtyState() {
 		"sessions": state,
 	})
 
-	// Copy subscribers to avoid holding lock during writes
-	subsMu.RLock()
-	subs := make([]*SafeConn, 0, len(ptySubscribers))
-	for ws := range ptySubscribers {
-		subs = append(subs, ws)
-	}
-	subsMu.RUnlock()
-
-	// Write to each subscriber (SafeConn handles its own locking)
-	for _, ws := range subs {
-		ws.WriteMessage(websocket.TextMessage, msg)
-	}
+	// Hand the frame to each subscriber's own write pump — never write from
+	// here, or one stalled peer stops live state for every other client.
+	fanoutStateFrame(msg)
 }
 
 // broadcastBoardItemsChanged notifies all /ws/pty-state subscribers that the
@@ -3054,17 +3049,7 @@ func broadcastPtyState() {
 // without a page reload.
 func broadcastBoardItemsChanged() {
 	msg, _ := json.Marshal(map[string]interface{}{"type": "board_items_changed"})
-
-	subsMu.RLock()
-	subs := make([]*SafeConn, 0, len(ptySubscribers))
-	for ws := range ptySubscribers {
-		subs = append(subs, ws)
-	}
-	subsMu.RUnlock()
-
-	for _, ws := range subs {
-		ws.WriteMessage(websocket.TextMessage, msg)
-	}
+	fanoutStateFrame(msg)
 }
 
 // === Projects Indexer ===
@@ -4481,17 +4466,12 @@ func handlePtyState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conn := &SafeConn{conn: rawConn}
-	defer conn.Close()
 
-	subsMu.Lock()
-	ptySubscribers[conn] = true
-	subsMu.Unlock()
-
-	defer func() {
-		subsMu.Lock()
-		delete(ptySubscribers, conn)
-		subsMu.Unlock()
-	}()
+	// Each subscriber gets its own buffered queue and writer goroutine; this
+	// goroutine only ever reads. See subscribers.go.
+	sub := newStateSub(conn)
+	registerStateSub(sub)
+	defer sub.stop("client disconnected")
 
 	// Send initial state
 	broadcastPtyState()
