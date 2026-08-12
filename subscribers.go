@@ -129,3 +129,62 @@ func fanoutStateFrame(msg []byte) {
 		s.enqueue(msg)
 	}
 }
+
+// --- connection liveness ---------------------------------------------------
+//
+// Until now the daemon set no read deadline and sent no websocket ping: a
+// connection lived until the client closed it or TCP gave up, and
+// docs/PTY-DIRECT-API.md promised exactly that ("the server never closes the
+// websocket itself"). On a LAN that promise is nearly free. Through a relay
+// the daemon acquires a "client" that is really a tunnel endpoint, perfectly
+// capable of holding a connection open long after the phone behind it is
+// gone — leaking subscribers, inflating the per-session client count in the
+// state frame, and feeding the fan-out with ghosts.
+//
+// So the daemon now pings and enforces a read deadline, chosen so that an
+// honest client still never gets disconnected:
+//
+//   - any inbound frame refreshes the deadline (SafeConn.ReadMessage), so the
+//     phone's own 20s {"type":"ping"} alone keeps the connection alive even
+//     if it ignores control frames entirely;
+//   - every RFC 6455 client (browsers included) answers a ping with a pong
+//     automatically, which also refreshes it;
+//   - the deadline is four ping periods, so a peer has to miss four
+//     consecutive round trips before it is considered gone.
+//
+// Variables rather than constants so tests can compress the timings.
+var (
+	wsPingPeriod = 30 * time.Second
+	wsPongWait   = 120 * time.Second
+)
+
+// armLiveness starts the server-side keepalive for one websocket. The
+// returned func stops the ping loop and must be called when the handler
+// returns.
+func armLiveness(sc *SafeConn) func() {
+	sc.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	sc.conn.SetPongHandler(func(string) error {
+		return sc.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(wsPingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if err := sc.WriteMessage(websocket.PingMessage, nil); err != nil {
+					// The reader will see the same failure and unwind;
+					// nothing to do here but stop pinging.
+					return
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() { once.Do(func() { close(stop) }) }
+}

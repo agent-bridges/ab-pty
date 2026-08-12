@@ -66,8 +66,16 @@ func (sc *SafeConn) WriteJSON(v interface{}) error {
 	return sc.conn.WriteJSON(v)
 }
 
+// ReadMessage extends the read deadline on every frame that arrives. Any
+// traffic at all — an application-level {"type":"ping"}, terminal input, a
+// pong — proves the peer is there, so a client that never learned about
+// websocket control frames still keeps itself alive simply by talking.
 func (sc *SafeConn) ReadMessage() (int, []byte, error) {
-	return sc.conn.ReadMessage()
+	t, data, err := sc.conn.ReadMessage()
+	if err == nil {
+		sc.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	}
+	return t, data, err
 }
 
 func (sc *SafeConn) Close() error {
@@ -4473,6 +4481,10 @@ func handlePtyState(w http.ResponseWriter, r *http.Request) {
 	registerStateSub(sub)
 	defer sub.stop("client disconnected")
 
+	// Server-side keepalive: without it a tunnel endpoint can hold this
+	// subscription open long after the client behind it is gone.
+	defer armLiveness(conn)()
+
 	// Send initial state
 	broadcastPtyState()
 
@@ -4498,6 +4510,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	conn := &SafeConn{conn: rawConn}
 	defer conn.Close()
+
+	// Server-side keepalive, same contract as /ws/pty-state: any inbound
+	// frame (the client's own ping, terminal input, a pong) refreshes the
+	// read deadline, so only a peer that has gone silent for four ping
+	// periods is torn down.
+	defer armLiveness(conn)()
 
 	var session *Session
 	var createErr error

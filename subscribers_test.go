@@ -1,9 +1,14 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // blockingWriter models the client that is gone but whose socket has not
@@ -129,5 +134,115 @@ func TestSlowSubscriberDoesNotStallOthers(t *testing.T) {
 
 	if !slowConn.isClosed() {
 		t.Fatal("stalled subscriber's connection was not closed")
+	}
+}
+
+// withFastLiveness compresses the keepalive timings so liveness tests run in
+// well under a second.
+func withFastLiveness(t *testing.T, ping, pong time.Duration) {
+	t.Helper()
+	oldPing, oldPong := wsPingPeriod, wsPongWait
+	wsPingPeriod, wsPongWait = ping, pong
+	t.Cleanup(func() { wsPingPeriod, wsPongWait = oldPing, oldPong })
+}
+
+func countStateSubs() int {
+	subsMu.RLock()
+	defer subsMu.RUnlock()
+	return len(ptySubscribers)
+}
+
+// A peer that stops answering must be torn down by the server. Before the
+// server-side ping and read deadline, nothing on the daemon side ever noticed
+// — the subscription lived until the client closed it, which a relay endpoint
+// holding a socket for a phone that is long gone never does.
+func TestServerDropsSilentClient(t *testing.T) {
+	initTestDB()
+	resetStateSubs()
+	defer resetStateSubs()
+	withFastLiveness(t, 50*time.Millisecond, 200*time.Millisecond)
+
+	srv := httptest.NewServer(http.HandlerFunc(handlePtyState))
+	defer srv.Close()
+
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer ws.Close()
+	// Play dead: never answer a ping, never send anything.
+	ws.SetPingHandler(func(string) error { return nil })
+
+	closed := make(chan struct{})
+	go func() {
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				close(closed)
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never closed the connection of a client that stopped answering")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for countStateSubs() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("subscriber leaked after the connection died")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The documented contract is that an honest client is never disconnected by
+// the server. This is the client the spec describes: it pings on its own
+// schedule and knows nothing about websocket control frames.
+func TestServerKeepsClientThatOnlySendsAppPings(t *testing.T) {
+	initTestDB()
+	resetStateSubs()
+	defer resetStateSubs()
+	withFastLiveness(t, 50*time.Millisecond, 200*time.Millisecond)
+
+	srv := httptest.NewServer(http.HandlerFunc(handlePtyState))
+	defer srv.Close()
+
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer ws.Close()
+	// Deliberately ignore server pings: only the app-level ping keeps this
+	// client alive, which is exactly what the spec promises is enough.
+	ws.SetPingHandler(func(string) error { return nil })
+
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				readErr <- err
+				return
+			}
+		}
+	}()
+
+	// Five app-level pings, one per read-deadline period — well past the
+	// point where a silent client would have been dropped.
+	for i := 0; i < 5; i++ {
+		if err := ws.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		select {
+		case err := <-readErr:
+			t.Fatalf("server disconnected a client that pings: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+
+	if n := countStateSubs(); n != 1 {
+		t.Fatalf("expected the subscriber to still be registered, got %d", n)
 	}
 }
