@@ -432,6 +432,15 @@ func generateSelfSignedCert(certPath, keyPath string, hosts []string, days int) 
 // and "rejected an unknown certificate" without a source address is useless
 // when three devices are on the LAN.
 func buildTLSConfig(mode string) (*tls.Config, error) {
+	return buildTLSConfigWithLoopback(mode, tlsAllowLoopback())
+}
+
+// buildTLSConfigWithLoopback takes the loopback exemption as an argument
+// instead of reading the environment, because not every listener gets to have
+// an opinion about it: the relay listener is built with required + no
+// exemption unconditionally (see relay.go), whatever AB_PTY_TLS_MODE and
+// AB_PTY_TLS_ALLOW_LOOPBACK say.
+func buildTLSConfigWithLoopback(mode string, allowLoopback bool) (*tls.Config, error) {
 	certPath, keyPath := tlsCertPath(), tlsKeyPath()
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
@@ -445,8 +454,6 @@ func buildTLSConfig(mode string) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 	}
-
-	allowLoopback := tlsAllowLoopback()
 
 	base.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 		peer := ""

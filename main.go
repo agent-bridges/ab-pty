@@ -1479,6 +1479,52 @@ func getProjectHashByPath(path string) string {
 	return hash
 }
 
+// buildMux is the complete, reviewable route table of the daemon. It is a
+// function rather than inline setup in main so that every listener — the
+// network one and the relay one (relay.go) — provably serves the same routes,
+// and so tests can drive the real handler set.
+func buildMux() *http.ServeMux {
+	// Routes live on a private mux rather than http.DefaultServeMux. The
+	// default mux is process-global: any package linked into the binary
+	// (net/http/pprof being the classic example) can register a handler on
+	// it and silently expose an endpoint we never audited. A private mux
+	// means the route table below is the complete, reviewable surface.
+	mux := http.NewServeMux()
+
+	// Public endpoints (no auth)
+	mux.HandleFunc("/info", handleInfo)
+	mux.HandleFunc("/health", handleHealth)
+
+	// Protected endpoints — accept either the daemon JWT (AB UI, admin CLI)
+	// or an in-session bearer token injected into PTY env (agent-to-daemon).
+	mux.HandleFunc("/api/pty", sessionTokenOrJwt(handleListPty))
+	mux.HandleFunc("/api/pty/", sessionTokenOrJwt(handlePtyAPI))
+	mux.HandleFunc("/api/board/items", sessionTokenOrJwt(handleBoardItems))
+	mux.HandleFunc("/api/board/items/", sessionTokenOrJwt(handleBoardItems))
+	mux.HandleFunc("/api/board/layouts", sessionTokenOrJwt(handleBoardLayouts))
+	mux.HandleFunc("/api/board/layouts/", sessionTokenOrJwt(handleBoardLayouts))
+	mux.HandleFunc("/api/projects", sessionTokenOrJwt(handleListProjects))
+	mux.HandleFunc("/api/projects/", sessionTokenOrJwt(handleProjectsAPI))
+	mux.HandleFunc("/api/sessions/", sessionTokenOrJwt(handleSessionsAPI))
+	mux.HandleFunc("/api/fs", sessionTokenOrJwt(handleFS))
+	mux.HandleFunc("/api/mkdir", sessionTokenOrJwt(handleMkdir))
+	mux.HandleFunc("/api/fs/download", sessionTokenOrJwt(handleFSDownload))
+	mux.HandleFunc("/api/fs/upload", sessionTokenOrJwt(handleFSUpload))
+	mux.HandleFunc("/api/paste-image", sessionTokenOrJwt(handlePasteImage))
+	mux.HandleFunc("/api/tunnels", sessionTokenOrJwt(handleTunnels))
+	mux.HandleFunc("/api/tunnels/", sessionTokenOrJwt(handleTunnels))
+	mux.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
+	mux.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
+
+	// Hook endpoint — called by Claude Code hooks running inside our own
+	// PTY sessions, so it carries no JWT. requireLoopback keeps it off the
+	// network: the daemon binds 0.0.0.0 and the handler mutates the
+	// claude-session→pty mapping, which a LAN neighbour must not reach.
+	mux.HandleFunc("/api/hook", requireLoopback(handleHook))
+
+	return mux
+}
+
 func main() {
 	// Handle subcommands
 	if len(os.Args) > 1 {
@@ -1603,43 +1649,7 @@ Setup:
 	ensureHooksConfigured()
 	ensureAbSkillInstalled()
 
-	// Routes live on a private mux rather than http.DefaultServeMux. The
-	// default mux is process-global: any package linked into the binary
-	// (net/http/pprof being the classic example) can register a handler on
-	// it and silently expose an endpoint we never audited. A private mux
-	// means the route table below is the complete, reviewable surface.
-	mux := http.NewServeMux()
-
-	// Public endpoints (no auth)
-	mux.HandleFunc("/info", handleInfo)
-	mux.HandleFunc("/health", handleHealth)
-
-	// Protected endpoints — accept either the daemon JWT (AB UI, admin CLI)
-	// or an in-session bearer token injected into PTY env (agent-to-daemon).
-	mux.HandleFunc("/api/pty", sessionTokenOrJwt(handleListPty))
-	mux.HandleFunc("/api/pty/", sessionTokenOrJwt(handlePtyAPI))
-	mux.HandleFunc("/api/board/items", sessionTokenOrJwt(handleBoardItems))
-	mux.HandleFunc("/api/board/items/", sessionTokenOrJwt(handleBoardItems))
-	mux.HandleFunc("/api/board/layouts", sessionTokenOrJwt(handleBoardLayouts))
-	mux.HandleFunc("/api/board/layouts/", sessionTokenOrJwt(handleBoardLayouts))
-	mux.HandleFunc("/api/projects", sessionTokenOrJwt(handleListProjects))
-	mux.HandleFunc("/api/projects/", sessionTokenOrJwt(handleProjectsAPI))
-	mux.HandleFunc("/api/sessions/", sessionTokenOrJwt(handleSessionsAPI))
-	mux.HandleFunc("/api/fs", sessionTokenOrJwt(handleFS))
-	mux.HandleFunc("/api/mkdir", sessionTokenOrJwt(handleMkdir))
-	mux.HandleFunc("/api/fs/download", sessionTokenOrJwt(handleFSDownload))
-	mux.HandleFunc("/api/fs/upload", sessionTokenOrJwt(handleFSUpload))
-	mux.HandleFunc("/api/paste-image", sessionTokenOrJwt(handlePasteImage))
-	mux.HandleFunc("/api/tunnels", sessionTokenOrJwt(handleTunnels))
-	mux.HandleFunc("/api/tunnels/", sessionTokenOrJwt(handleTunnels))
-	mux.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
-	mux.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
-
-	// Hook endpoint — called by Claude Code hooks running inside our own
-	// PTY sessions, so it carries no JWT. requireLoopback keeps it off the
-	// network: the daemon binds 0.0.0.0 and the handler mutates the
-	// claude-session→pty mapping, which a LAN neighbour must not reach.
-	mux.HandleFunc("/api/hook", requireLoopback(handleHook))
+	mux := buildMux()
 
 	// Periodic PTY state broadcast (processes change without events)
 	go func() {
@@ -1716,6 +1726,18 @@ Setup:
 		// fixed timer regardless of activity. ReadHeaderTimeout covers the
 		// pre-hijack window, which is the part that needs a bound; the
 		// long-lived phase is policed by the websocket ping/pong loop.
+	}
+
+	// Relay path (docs/RELAY.md). Phase 0 wires the synthetic listener but
+	// has no tunnel feeding it yet; when the ssh side lands it delivers its
+	// channels to exactly this listener, and inherits this mux and a
+	// required-mTLS config without a second authentication path existing.
+	if relayEnabled() {
+		ln, rerr := serveRelay(srv)
+		if rerr != nil {
+			log.Fatal(rerr)
+		}
+		relayLn = ln
 	}
 
 	// Graceful shutdown. systemd sends SIGTERM on `systemctl restart`; the
