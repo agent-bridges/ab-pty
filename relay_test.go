@@ -245,6 +245,28 @@ func TestRelayAddrIsNotLoopback(t *testing.T) {
 	}
 }
 
+// The startup safety check. The relay listener ignores the loopback exemption
+// by construction; this makes the combination impossible to configure in the
+// first place, so nobody has to rely on remembering why it is safe.
+func TestRelayRefusesLoopbackExemption(t *testing.T) {
+	t.Setenv(relayEnabledEnv, "1")
+	t.Setenv(tlsAllowLoopbackEnv, "1")
+	if err := validateRelayConfig(); err == nil {
+		t.Fatal("daemon would start with the relay enabled and the loopback exemption on")
+	}
+
+	t.Setenv(tlsAllowLoopbackEnv, "0")
+	if err := validateRelayConfig(); err != nil {
+		t.Fatalf("relay alone must be allowed: %v", err)
+	}
+
+	t.Setenv(relayEnabledEnv, "0")
+	t.Setenv(tlsAllowLoopbackEnv, "1")
+	if err := validateRelayConfig(); err != nil {
+		t.Fatalf("the exemption alone must stay allowed (no relay involved): %v", err)
+	}
+}
+
 // isHandshakeRejection distinguishes "the TLS handshake was refused" from any
 // other transport failure, so the rejection tests cannot pass for the wrong
 // reason (a broken pipe, a timeout, a nil listener).

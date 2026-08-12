@@ -58,6 +58,25 @@ func relayEnabled() bool {
 	return v == "1" || v == "true" || v == "yes"
 }
 
+// validateRelayConfig refuses combinations that would put the daemon on the
+// public internet with a weaker rule than it thinks it has.
+//
+// The relay listener ignores AB_PTY_TLS_ALLOW_LOOPBACK by construction, so
+// this check is belt to that braces. It exists because the failure it guards
+// against is silent and total: an operator who sets the exemption for the
+// in-session CLI and then turns on the relay would have every reason to
+// believe the two are unrelated, and no way to notice if they were not.
+func validateRelayConfig() error {
+	if relayEnabled() && tlsAllowLoopback() {
+		return fmt.Errorf(
+			"%s=1 is incompatible with %s=1: the relay carries connections from an untrusted network, "+
+				"and a loopback exemption must never be one bug away from applying to them. "+
+				"Run a second, loopback-only daemon for the local callers that need the exemption",
+			relayEnabledEnv, tlsAllowLoopbackEnv)
+	}
+	return nil
+}
+
 // --- synthetic address / connection ---------------------------------------
 
 // relayAddr is a net.Addr that is intentionally not an IP. See the header

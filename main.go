@@ -1641,6 +1641,13 @@ Setup:
 		port = "8421"
 	}
 
+	// Checked before anything is opened: a daemon that would expose the
+	// relay under a loopback exemption must not run at all, not run and
+	// complain. See validateRelayConfig in relay.go.
+	if err := validateRelayConfig(); err != nil {
+		log.Fatal(err)
+	}
+
 	initDB()
 	restoreSessions()
 	cleanupStaleBoardItems()
