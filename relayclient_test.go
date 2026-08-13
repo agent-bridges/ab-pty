@@ -33,10 +33,11 @@ type fakeRelay struct {
 	connects int
 	closed   bool
 
-	// The hostile half: when blackhole is set every DATA connection is
-	// accepted and then never answered, which is what a compromised VPS
-	// does to make the daemon spend sockets it will never get anything
-	// back for.
+	// The hostile half. keepalive is what the greeting announces; when
+	// blackhole is set every DATA connection is accepted and then never
+	// answered, which is what a compromised VPS does to make the daemon
+	// spend sockets it will never get anything back for.
+	keepalive string
 	blackhole bool
 	holding   []net.Conn
 	held      int
@@ -65,8 +66,9 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 		cfg: &tls.Config{Certificates: []tls.Certificate{pair}, ClientAuth: tls.RequireAnyClientCert, MinVersion: tls.VersionTLS12},
 		// The relay never verifies a chain — agents are self-signed and
 		// pinned by fingerprint, exactly like the daemon's own clients.
-		addr:    ln.Addr().String(),
-		pending: map[string]chan net.Conn{},
+		addr:      ln.Addr().String(),
+		pending:   map[string]chan net.Conn{},
+		keepalive: "1",
 	}
 	r.cfg.InsecureSkipVerify = true
 	go r.accept()
@@ -185,7 +187,10 @@ func (r *fakeRelay) control(c net.Conn) {
 		c.Close()
 		return
 	}
-	if _, err := fmt.Fprintf(c, "%s OK id=%s name=test keepalive=1\n", relayProtoMagic, fp); err != nil {
+	r.mu.Lock()
+	ka := r.keepalive
+	r.mu.Unlock()
+	if _, err := fmt.Fprintf(c, "%s OK id=%s name=test keepalive=%s\n", relayProtoMagic, fp, ka); err != nil {
 		c.Close()
 		return
 	}
@@ -317,7 +322,7 @@ type relayClientStand struct {
 	stop  chan struct{}
 }
 
-func newRelayClientStand(t *testing.T) *relayClientStand {
+func newRelayClientStand(t *testing.T, opts ...func(*fakeRelay)) *relayClientStand {
 	t.Helper()
 	initTestDB()
 	initTLSClientsTable()
@@ -342,6 +347,9 @@ func newRelayClientStand(t *testing.T) *relayClientStand {
 		t.Fatal(err)
 	}
 	relay := newFakeRelay(t)
+	for _, o := range opts {
+		o(relay)
+	}
 
 	m := &relayManager{ln: ln}
 	stop := make(chan struct{})
@@ -727,5 +735,47 @@ func TestRelayClientStillServesStreamsUnderTheCap(t *testing.T) {
 	}
 	if s.relay.connectCount() != 1 {
 		t.Fatalf("the control channel was dropped %d times by ordinary traffic", s.relay.connectCount()-1)
+	}
+}
+
+// The keepalive comes from the untrusted side and decides how long the daemon
+// will sit on a channel that has gone quiet (the read timeout is three times
+// it). Unbounded, one line from a hostile relay strands the machine: it never
+// notices the channel is dead, so it never reconnects and never comes back.
+func TestRelayClientClampsAnnouncedKeepalive(t *testing.T) {
+	s := newRelayClientStand(t, func(r *fakeRelay) { r.keepalive = "1000000000" })
+
+	deadline := time.Now().Add(5 * time.Second)
+	var got time.Duration
+	for time.Now().Before(deadline) {
+		if got = s.m.keepalive(); got > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got == 0 {
+		t.Fatal("the daemon never recorded a keepalive")
+	}
+	if got > relayMaxKeepIv {
+		t.Fatalf("the daemon accepted a keepalive of %s from the relay; the ceiling is %s", got, relayMaxKeepIv)
+	}
+}
+
+func TestClampRelayKeepalive(t *testing.T) {
+	cases := []struct {
+		in   int
+		want time.Duration
+	}{
+		{0, relayDefaultKeepIv},
+		{-5, relayDefaultKeepIv},
+		{1, relayMinKeepIv},
+		{30, 30 * time.Second},
+		{1 << 40, relayMaxKeepIv},
+		{1000000000, relayMaxKeepIv},
+	}
+	for _, c := range cases {
+		if got := clampRelayKeepalive(c.in); got != c.want {
+			t.Errorf("clampRelayKeepalive(%d) = %s, want %s", c.in, got, c.want)
+		}
 	}
 }

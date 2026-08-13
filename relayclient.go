@@ -88,6 +88,14 @@ const (
 	// backoff schedule, which costs the relay far more than it costs us.
 	relayOpenFloodWindow = time.Minute
 	relayOpenFloodBurst  = 128
+
+	// Bounds on the keepalive the relay announces. The value decides how
+	// long this daemon will sit on a channel that has stopped carrying
+	// anything (the read timeout is three times it), so an unbounded value
+	// from an untrusted peer means "never notice you are cut off, never
+	// reconnect" — a one-line way for a relay to strand a machine.
+	relayMinKeepIv = time.Second
+	relayMaxKeepIv = 5 * time.Minute
 )
 
 // relayMaxStreams is the concurrency ceiling for relay-initiated streams.
@@ -98,6 +106,24 @@ func relayMaxStreams() int {
 		}
 	}
 	return relayDefaultMaxStreams
+}
+
+// clampRelayKeepalive turns the relay's announced keepalive into one this
+// daemon is willing to live with. Anything outside the bounds is clamped
+// rather than refused: the relay's owner may legitimately want a different
+// period, they just do not get to choose "infinite".
+func clampRelayKeepalive(seconds int) time.Duration {
+	if seconds <= 0 {
+		return relayDefaultKeepIv
+	}
+	d := time.Duration(seconds) * time.Second
+	if seconds > int(relayMaxKeepIv/time.Second) || d <= 0 { // d <= 0 catches overflow
+		return relayMaxKeepIv
+	}
+	if d < relayMinKeepIv {
+		return relayMinKeepIv
+	}
+	return d
 }
 
 // --- persisted state -------------------------------------------------------
@@ -247,6 +273,11 @@ type relayManager struct {
 	// sockets from the previous session are still ours to pay for until
 	// they time out, so the ceiling has to span sessions.
 	inFlight atomic.Int64
+
+	// keepAliveNs is the interval last agreed with the relay, after
+	// clamping. Exported through this field only so tests can see what the
+	// daemon actually accepted.
+	keepAliveNs atomic.Int64
 }
 
 // acquireStream takes one of the stream slots, or reports that they are all
@@ -269,6 +300,8 @@ func (m *relayManager) releaseStream() { m.inFlight.Add(-1) }
 
 // streamsInFlight is for tests and diagnostics.
 func (m *relayManager) streamsInFlight() int { return int(m.inFlight.Load()) }
+
+func (m *relayManager) keepalive() time.Duration { return time.Duration(m.keepAliveNs.Load()) }
 
 var relayMgr *relayManager
 
@@ -414,13 +447,14 @@ func (m *relayManager) connectOnce(cfg RelayConfig, stop <-chan struct{}) error 
 		switch k {
 		case "keepalive":
 			if n, e := strconv.Atoi(v); e == nil && n > 0 {
-				keepalive = time.Duration(n) * time.Second
+				keepalive = clampRelayKeepalive(n)
 			}
 		case "name":
 			name = v
 		}
 	}
 	_ = conn.SetDeadline(time.Time{})
+	m.keepAliveNs.Store(int64(keepalive))
 	setRelayState("connected", "", true)
 	log.Printf("relay: connected to %s as %q (keepalive %s)", cfg.Address, name, keepalive)
 	defer setRelayState("disconnected", "", false)
