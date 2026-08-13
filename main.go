@@ -1516,6 +1516,14 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
 	mux.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
 
+	// The machine's own client allow-list, editable only by a device this
+	// machine already admits — see clientsapi.go for the three conditions
+	// and for why this grant can never live on the relay. Wrapped in
+	// sessionTokenOrJwt as well: the certificate says who is asking, the
+	// key says they are allowed to ask for anything at all.
+	mux.HandleFunc("/api/tls/clients", sessionTokenOrJwt(requireEnrolledClient(handleTLSClients)))
+	mux.HandleFunc("/api/tls/clients/", sessionTokenOrJwt(requireEnrolledClient(handleTLSClients)))
+
 	// Hook endpoint — called by Claude Code hooks running inside our own
 	// PTY sessions, so it carries no JWT. requireLoopback keeps it off the
 	// network: the daemon binds 0.0.0.0 and the handler mutates the

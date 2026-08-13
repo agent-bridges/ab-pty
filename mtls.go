@@ -531,6 +531,45 @@ func makePeerVerifier(mode string, peer string) func([][]byte, [][]*x509.Certifi
 	}
 }
 
+// effectiveTLSMode answers the question the process-wide mode cannot: was a
+// client certificate *mandatory and checked* on the connection this request
+// arrived over.
+//
+// The daemon serves two listeners from one http.Server and they do not agree.
+// The relay listener is always required and always without the loopback
+// exemption, whatever the environment says (relay.go); the network listener
+// follows AB_PTY_TLS_MODE, downgraded to optional for a loopback peer when
+// the exemption is on. A caller that consulted tlsMode() alone would refuse a
+// legitimate request arriving through a relay onto a daemon whose own port is
+// plain HTTP — which is the normal deployment.
+//
+// Deliberately mirrors the rule in buildTLSConfigWithLoopback rather than
+// abbreviating it. The two must agree, and the way to keep them agreeing is
+// for both to be readable side by side.
+func effectiveTLSMode(r *http.Request) string {
+	if isRelayRequest(r) {
+		return TLSModeRequired
+	}
+	mode := tlsMode()
+	if mode == TLSModeRequired && tlsAllowLoopback() && isLoopbackAddr(r.RemoteAddr) {
+		return TLSModeOptional
+	}
+	return mode
+}
+
+// isRelayRequest reports whether this request came through the relay
+// listener, whose connections wear a synthetic address that is not an IP
+// (relay.go). Recognised by that address rather than by a flag on the
+// request, for the same reason the loopback checks reject it: one property of
+// the connection, checked the same way everywhere.
+func isRelayRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return strings.HasPrefix(host, relayNetwork+"/")
+}
+
 // tlsPeerName returns the allow-listed name for the certificate on this
 // request, if any. Used by /info so the app can tell "my cert is registered"
 // from "my cert is being tolerated because the daemon is in optional mode".
