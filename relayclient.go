@@ -39,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -64,7 +65,40 @@ const (
 	relayBackoffMax    = 60 * time.Second
 	relayConfigPoll    = 3 * time.Second
 	relayDefaultKeepIv = 30 * time.Second
+
+	// How many streams this daemon will have open through the relay at
+	// once. The relay is UNTRUSTED (docs/RELAY.md): OPEN is a line of text
+	// from a machine that may have been taken over, and every OPEN costs a
+	// goroutine and a fresh outbound socket. Without a ceiling here a
+	// compromised VPS empties this daemon's file-descriptor table and its
+	// ephemeral port range without holding a single credential for any
+	// session — the relay would be controlling the daemon, which is exactly
+	// what the threat model says it must not be able to do.
+	//
+	// The default matches ab-relay's own -max-streams default, so a
+	// well-behaved relay never reaches it: the relay refuses the client
+	// before the daemon has to. Raise both together if a machine really
+	// needs more concurrent streams.
+	relayDefaultMaxStreams = 32
+	relayMaxStreamsEnv     = "AB_PTY_RELAY_MAX_STREAMS"
+
+	// A relay that keeps asking for streams the daemon has already refused
+	// is either broken or hostile, and there is no useful difference: in
+	// both cases the right answer is to hang up and come back on the
+	// backoff schedule, which costs the relay far more than it costs us.
+	relayOpenFloodWindow = time.Minute
+	relayOpenFloodBurst  = 128
 )
+
+// relayMaxStreams is the concurrency ceiling for relay-initiated streams.
+func relayMaxStreams() int {
+	if v := strings.TrimSpace(os.Getenv(relayMaxStreamsEnv)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return relayDefaultMaxStreams
+}
 
 // --- persisted state -------------------------------------------------------
 
@@ -206,7 +240,35 @@ type relayManager struct {
 	mu     sync.Mutex
 	cur    RelayConfig
 	cancel chan struct{}
+
+	// inFlight counts streams opened on the relay's orders and not yet
+	// finished. It lives on the manager rather than on one control session
+	// on purpose: a hostile relay that gets hung up on reconnects, and the
+	// sockets from the previous session are still ours to pay for until
+	// they time out, so the ceiling has to span sessions.
+	inFlight atomic.Int64
 }
+
+// acquireStream takes one of the stream slots, or reports that they are all
+// taken. A compare-and-swap, not a read followed by an increment: OPEN lines
+// arrive as fast as the relay can write them, and a check that is not part of
+// the same atomic step is not a limit.
+func (m *relayManager) acquireStream(max int) bool {
+	for {
+		cur := m.inFlight.Load()
+		if int(cur) >= max {
+			return false
+		}
+		if m.inFlight.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (m *relayManager) releaseStream() { m.inFlight.Add(-1) }
+
+// streamsInFlight is for tests and diagnostics.
+func (m *relayManager) streamsInFlight() int { return int(m.inFlight.Load()) }
 
 var relayMgr *relayManager
 
@@ -379,6 +441,10 @@ func (m *relayManager) connectOnce(cfg RelayConfig, stop <-chan struct{}) error 
 		}
 	}()
 
+	maxStreams := relayMaxStreams()
+	dropped := 0
+	windowStart := time.Now()
+
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 		line, err := relayReadLine(conn, relayMaxLine)
@@ -388,7 +454,31 @@ func (m *relayManager) connectOnce(cfg RelayConfig, stop <-chan struct{}) error 
 		verb, arg := relaySplit(line)
 		switch verb {
 		case relayMsgOpen:
-			go m.openStream(cfg, arg)
+			// Refuse rather than queue. A dropped OPEN costs the
+			// client on the other end one `timeout` error and a
+			// retry; a queued one costs this machine a socket it
+			// did not agree to spend, and the queue is written by
+			// the untrusted side.
+			if !m.acquireStream(maxStreams) {
+				now := time.Now()
+				if now.Sub(windowStart) > relayOpenFloodWindow {
+					windowStart, dropped = now, 0
+				}
+				dropped++
+				if dropped == 1 || dropped%32 == 0 {
+					log.Printf("relay: %s asked for a stream past the limit of %d (%d refused); dropping the request",
+						cfg.Address, maxStreams, dropped)
+				}
+				if dropped >= relayOpenFloodBurst {
+					return fmt.Errorf("relay %s pushed %d stream requests past the limit of %d in %s: hanging up",
+						cfg.Address, dropped, maxStreams, time.Since(windowStart).Truncate(time.Millisecond))
+				}
+				continue
+			}
+			go func(ticket string) {
+				defer m.releaseStream()
+				m.openStream(cfg, ticket)
+			}(arg)
 		case relayMsgPing:
 			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := fmt.Fprintf(conn, "%s %s\n", relayMsgPong, arg); err != nil {
@@ -534,6 +624,10 @@ Environment (overrides the stored configuration; for containers and unit files):
   AB_PTY_RELAY_ADDR          relay address host:port
   AB_PTY_RELAY_LABEL         label reported to the relay
   AB_PTY_RELAY_PIN           expected SHA-256 of the relay's own certificate
+  AB_PTY_RELAY_MAX_STREAMS   concurrent streams the relay may ask for (default 32).
+                             The relay is untrusted: past this the daemon drops
+                             OPEN requests, and a relay that keeps pushing has
+                             its control channel hung up on.
 `
 
 func runRelay(args []string) {

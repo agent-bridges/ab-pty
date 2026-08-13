@@ -32,6 +32,15 @@ type fakeRelay struct {
 	pending  map[string]chan net.Conn
 	connects int
 	closed   bool
+
+	// The hostile half: when blackhole is set every DATA connection is
+	// accepted and then never answered, which is what a compromised VPS
+	// does to make the daemon spend sockets it will never get anything
+	// back for.
+	blackhole bool
+	holding   []net.Conn
+	held      int
+	peakHeld  int
 }
 
 func newFakeRelay(t *testing.T) *fakeRelay {
@@ -133,6 +142,17 @@ func (r *fakeRelay) handle(c net.Conn) {
 		return
 	}
 	r.mu.Lock()
+	if r.blackhole {
+		r.held++
+		if r.held > r.peakHeld {
+			r.peakHeld = r.held
+		}
+		// Keep a reference: an unreferenced net.Conn is finalised and
+		// closed, which would let the daemon off the hook.
+		r.holding = append(r.holding, c)
+		r.mu.Unlock()
+		return
+	}
 	ch := r.pending[f[2]]
 	delete(r.pending, f[2])
 	r.mu.Unlock()
@@ -225,6 +245,33 @@ func (r *fakeRelay) waitAgent(d time.Duration) bool {
 	return false
 }
 
+// sendOpen writes one OPEN line down the control channel without waiting for
+// anything: this is the hostile relay's only move, and it costs it one line.
+func (r *fakeRelay) sendOpen(ticket string) error {
+	r.mu.Lock()
+	ctl := r.ctl
+	r.mu.Unlock()
+	if ctl == nil {
+		return fmt.Errorf("no agent connected")
+	}
+	_, err := fmt.Fprintf(ctl, "%s %s\n", relayMsgOpen, ticket)
+	return err
+}
+
+func (r *fakeRelay) setBlackhole(v bool) {
+	r.mu.Lock()
+	r.blackhole = v
+	r.mu.Unlock()
+}
+
+// peakStreams is the high-water mark of data connections the daemon had open
+// here at one time — the number the daemon paid for.
+func (r *fakeRelay) peakStreams() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.peakHeld
+}
+
 func (r *fakeRelay) connectCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -266,6 +313,7 @@ func readRelayLine(r io.Reader) (string, error) {
 // the HTTP handler and the socket is stubbed.
 type relayClientStand struct {
 	relay *fakeRelay
+	m     *relayManager
 	stop  chan struct{}
 }
 
@@ -306,7 +354,7 @@ func newRelayClientStand(t *testing.T) *relayClientStand {
 	if !relay.waitAgent(10 * time.Second) {
 		t.Fatal("the daemon never registered with the relay")
 	}
-	return &relayClientStand{relay: relay, stop: stop}
+	return &relayClientStand{relay: relay, m: m, stop: stop}
 }
 
 // dialViaRelay is the transport a phone would have: every HTTP connection is a
@@ -583,5 +631,101 @@ func TestRelayFromDatabaseStillRefusesLoopbackExemption(t *testing.T) {
 	}
 	if err := validateRelayActive(true); err == nil {
 		t.Fatal("a database-configured relay escapes the loopback check")
+	}
+}
+
+// The relay is untrusted, and OPEN is a line of text it can write as fast as
+// the socket takes it. Each one costs this daemon a goroutine and an outbound
+// socket, so an unbounded loop here means a compromised VPS can empty the
+// machine's file-descriptor table without holding a credential for a single
+// session — the relay controlling the daemon, which docs/RELAY.md says it must
+// never be able to do.
+//
+// The relay here is the hostile one: it floods OPEN and answers none of the
+// data connections, so nothing ever completes and every stream stays parked.
+func TestRelayClientCapsConcurrentStreams(t *testing.T) {
+	s := newRelayClientStand(t)
+	s.relay.setBlackhole(true)
+
+	for i := 0; i < 400; i++ {
+		if err := s.relay.sendOpen(fmt.Sprintf("flood%d", i)); err != nil {
+			break // the daemon hung up on us, which is the other half of the fix
+		}
+	}
+
+	// Give it every chance to overspend.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.relay.peakStreams() > relayDefaultMaxStreams {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	peak := s.relay.peakStreams()
+	if peak > relayDefaultMaxStreams {
+		t.Fatalf("the daemon held %d streams at once for a relay that answers none of them; the cap is %d",
+			peak, relayDefaultMaxStreams)
+	}
+	if peak == 0 {
+		t.Fatal("no stream was opened at all — the test proved nothing")
+	}
+	if n := s.m.streamsInFlight(); n > relayDefaultMaxStreams {
+		t.Fatalf("%d streams in flight, cap is %d", n, relayDefaultMaxStreams)
+	}
+
+	// Sustained overshoot is not something to sit through politely: the
+	// daemon drops the control channel and comes back on the backoff
+	// schedule, which costs the relay much more than it costs the machine.
+	hangup := time.Now().Add(10 * time.Second)
+	for time.Now().Before(hangup) {
+		if s.relay.connectCount() >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if s.relay.connectCount() < 2 {
+		t.Fatal("the daemon kept a control channel that was flooding it with refused requests")
+	}
+}
+
+// A normal, well-behaved relay must not notice the cap: streams below it are
+// served exactly as before, and the daemon keeps its channel.
+func TestRelayClientStillServesStreamsUnderTheCap(t *testing.T) {
+	s := newRelayClientStand(t)
+	cert, fp := newClientCert(t)
+	if err := addAuthorizedClient("test-phone", fp); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			DialContext:     dialViaRelay(s.relay),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, Certificates: []tls.Certificate{cert}},
+			MaxConnsPerHost: 8,
+		},
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 24)
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := client.Get("https://relay/health")
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("a request under the cap failed: %v", err)
+	}
+	if s.relay.connectCount() != 1 {
+		t.Fatalf("the control channel was dropped %d times by ordinary traffic", s.relay.connectCount()-1)
 	}
 }
