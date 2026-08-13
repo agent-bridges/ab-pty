@@ -171,11 +171,16 @@ func loadRelayConfig() RelayConfig {
 	err := db.QueryRow(`SELECT enabled, address, label, pin, COALESCE(last_success,''), last_error, state
 	                    FROM relay_config WHERE id = 1`).
 		Scan(&enabled, &c.Address, &c.Label, &c.Pin, &lastSuccess, &c.LastError, &c.State)
-	if err != nil {
-		return c
+	// A missing row is the normal state of a fresh install, not a failure: fall
+	// through so the environment below still applies. Returning here is what
+	// made the documented env-only configuration silently do nothing until
+	// somebody ran `ab-pty relay connect`.
+	if err == nil {
+		c.Enabled = enabled != 0
+		c.LastSuccess = lastSuccess.String
+	} else if err != sql.ErrNoRows {
+		log.Printf("relay: reading relay_config: %v", err)
 	}
-	c.Enabled = enabled != 0
-	c.LastSuccess = lastSuccess.String
 
 	// The environment wins over the database so that a container or a unit
 	// file can pin the relay without anyone shelling in to run a command.
