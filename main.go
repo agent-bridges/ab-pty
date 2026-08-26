@@ -4094,6 +4094,8 @@ func classifyPtyCreateError(err error) string {
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(msg, "session name") && strings.Contains(msg, "already in use"):
+		return "session_name_conflict"
 	case strings.Contains(msg, "project path not found"):
 		return "project_path_not_found"
 	case strings.Contains(msg, "project path is not a directory"):
@@ -4164,10 +4166,15 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				details = err.Error()
 			}
-			writeJSON(w, 500, map[string]interface{}{
+			errorType := classifyPtyCreateError(err)
+			status := http.StatusInternalServerError
+			if errorType == "session_name_conflict" {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]interface{}{
 				"error":      "Failed to create PTY session",
 				"details":    details,
-				"error_type": classifyPtyCreateError(err),
+				"error_type": errorType,
 			})
 			return
 		}

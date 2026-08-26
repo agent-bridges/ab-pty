@@ -660,6 +660,49 @@ func TestPtyCreateAPIRejectsLegacyIdentityFields(t *testing.T) {
 	}
 }
 
+func TestPtyCreateAPIReturnsConflictForDuplicateLiveName(t *testing.T) {
+	initTestDB()
+	sessionsMu.Lock()
+	sessions = make(map[string]*Session)
+	sessionsMu.Unlock()
+
+	requestBody := `{"project_path":"/tmp","shell_only":true,"name":"duplicate-live-name"}`
+	firstReq := httptest.NewRequest(http.MethodPost, "/api/pty", strings.NewReader(requestBody))
+	firstResp := httptest.NewRecorder()
+	handleListPty(firstResp, firstReq)
+	if firstResp.Code != http.StatusOK {
+		t.Fatalf("first create failed: status=%d body=%s", firstResp.Code, firstResp.Body.String())
+	}
+	var created struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(firstResp.Body.Bytes(), &created); err != nil || created.SessionID == "" {
+		t.Fatalf("invalid first create response: err=%v body=%s", err, firstResp.Body.String())
+	}
+	defer killSession(created.SessionID)
+
+	duplicateReq := httptest.NewRequest(http.MethodPost, "/api/pty", strings.NewReader(requestBody))
+	duplicateResp := httptest.NewRecorder()
+	handleListPty(duplicateResp, duplicateReq)
+	if duplicateResp.Code != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d: %s", duplicateResp.Code, duplicateResp.Body.String())
+	}
+	var conflict map[string]interface{}
+	if err := json.Unmarshal(duplicateResp.Body.Bytes(), &conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict["error_type"] != "session_name_conflict" {
+		t.Fatalf("unexpected conflict classification: %v", conflict)
+	}
+
+	sessionsMu.RLock()
+	count := len(sessions)
+	sessionsMu.RUnlock()
+	if count != 1 {
+		t.Fatalf("duplicate create changed live sessions: got %d", count)
+	}
+}
+
 func TestPtyRenameAPIIsUniqueAndPersistent(t *testing.T) {
 	initTestDB()
 	sessionsMu.Lock()
