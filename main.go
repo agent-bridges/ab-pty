@@ -2389,6 +2389,8 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	// the full environment from /etc/profile + ~/.bashrc (identical to SSH).
 	// For claude sessions: inherit daemon env (needs PATH to find claude binary).
 	var cmd *exec.Cmd
+	originalCustomCmd := append([]string(nil), customCmd...)
+	customCmd = preferCodexResumeLast(customCmd)
 	if len(customCmd) > 0 {
 		cmd = exec.Command(customCmd[0], customCmd[1:]...)
 		cmd.Env = nil // inherit nothing — let login shell build env
@@ -2450,11 +2452,25 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 		cmd.Env = append(cmd.Env, "AB_PTY_PORT="+port)
 	}
 
+	if shouldUseCodexAppServer(customCmd) {
+		sessionEnv := append([]string(nil), cmd.Env...)
+		rewritten, appServerErr := startCodexAppServer(sessionID, projectPath, sessionEnv, customCmd)
+		if appServerErr != nil {
+			log.Printf("Codex app-server unavailable for %s, using legacy status tracking: %v", sessionID, appServerErr)
+		} else {
+			customCmd = rewritten
+			cmd = loginExecCommand(customCmd)
+			cmd.Dir = projectPath
+			cmd.Env = sessionEnv
+		}
+	}
+
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
 		Rows: uint16(rows),
 		Cols: uint16(cols),
 	})
 	if err != nil {
+		stopCodexAppServer(sessionID)
 		log.Printf("Failed to start PTY (path=%s, cmd=%v): %v", projectPath, cmd.Args, err)
 		return nil, fmt.Errorf("path=%s cmd=%v: %w", projectPath, cmd.Args, err)
 	}
@@ -2483,6 +2499,10 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 			name = name + "-" + shortUID
 		}
 		if existing := findAliveSessionByName(name); existing != "" && existing != sessionID {
+			_ = ptmx.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			stopCodexAppServer(sessionID)
 			return nil, fmt.Errorf("session name %q is already in use by %s", name, existing)
 		}
 	}
@@ -2515,6 +2535,9 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	}
 	if continueSession != "" {
 		meta["claude_session_id"] = continueSession
+	}
+	if len(originalCustomCmd) > 0 {
+		meta["launch_cmd"] = originalCustomCmd
 	}
 	setSessionMeta(sessionID, nil, nil, meta)
 
@@ -2793,6 +2816,7 @@ func readPtyLoop(session *Session) {
 	}
 
 	session.setAlive(false)
+	stopCodexAppServer(session.ID)
 	deactivateSession(session.ID)
 	broadcastToClients(session, map[string]interface{}{"type": "session_ended"})
 	broadcastPtyState()
@@ -2826,6 +2850,7 @@ func killSession(sessionID string) {
 	sessionsMu.Unlock()
 
 	session.setAlive(false)
+	stopCodexAppServer(sessionID)
 	if session.Cmd != nil && session.Cmd.Process != nil {
 		session.Cmd.Process.Kill()
 		session.Cmd.Wait()
@@ -2882,6 +2907,7 @@ func restoreSessions() {
 		projectPath, _ := meta["project_path"].(string)
 		projectName, _ := meta["project_name"].(string)
 		claudeSessionID, _ := meta["claude_session_id"].(string)
+		launchCmd := stringSliceFromJSON(meta["launch_cmd"])
 
 		// Determine start path
 		startPath := lastCwd
@@ -2913,7 +2939,9 @@ func restoreSessions() {
 			session *Session
 			err     error
 		)
-		if shellOnly {
+		if len(launchCmd) > 0 {
+			session, err = createPtySession(startPath, 40, 120, projectName, "", true, id, launchCmd)
+		} else if shellOnly {
 			// Bash: start in last_cwd
 			session, err = createPtySession(startPath, 40, 120, projectName, "", true, id, nil)
 		} else if claudeSessionID != "" {
@@ -2933,10 +2961,8 @@ func restoreSessions() {
 			// before the restart, re-launch it by feeding the command into the
 			// new shell's stdin. Only applies to shell sessions — claude-only
 			// sessions are already resumed via --resume above.
-			if shellOnly {
-				if aiCmd, ok := meta["last_ai_cmd"].(string); ok && aiCmd != "" {
-					go relaunchAICmd(session, aiCmd)
-				}
+			if aiCmd, _ := meta["last_ai_cmd"].(string); shouldRelaunchAICmd(shellOnly, launchCmd, aiCmd) {
+				go relaunchAICmd(session, aiCmd)
 			}
 		} else if err != nil {
 			log.Printf("Failed to restore session %s: %v", id, err)
@@ -2946,6 +2972,10 @@ func restoreSessions() {
 	if restored > 0 {
 		log.Printf("Restored %d sessions", restored)
 	}
+}
+
+func shouldRelaunchAICmd(shellOnly bool, launchCmd []string, aiCmd string) bool {
+	return shellOnly && len(launchCmd) == 0 && aiCmd != ""
 }
 
 // relaunchAICmd writes an AI command into a freshly-restored shell session so
@@ -3062,8 +3092,9 @@ func broadcastPtyState() {
 
 		// Auto-clear stale hook-based AI status: if status says working but no known
 		// AI process is found, the agent was likely interrupted.
-		aiSt := getAiStatus(s.ID)
-		if aiSt != "" && aiSt != "idle" {
+		statusEntry, hasStatusEntry := getAiStatusEntry(s.ID)
+		aiSt := statusEntry.Status
+		if hasStatusEntry && !statusEntry.Authoritative && aiSt != "idle" {
 			hasAI := false
 			for _, p := range processes {
 				switch p.Cmd {
@@ -3079,7 +3110,7 @@ func broadcastPtyState() {
 				aiSt = ""
 			}
 		}
-		if aiSt == "" || (aiSt == "idle" && hasCodex && !hasClaude) {
+		if !statusEntry.Authoritative && (aiSt == "" || (aiSt == "idle" && hasCodex && !hasClaude)) {
 			aiSt = getCodexHeuristicStatus(s, processes)
 		}
 
@@ -5567,9 +5598,10 @@ var (
 )
 
 type aiStatusEntry struct {
-	Status    string // "working", "idle", "tool:Bash", "tool:Edit", etc.
-	Tool      string // current tool name (if working)
-	UpdatedAt time.Time
+	Status        string // "working", "idle", "tool:Bash", "tool:Edit", etc.
+	Tool          string // current tool name (if working)
+	UpdatedAt     time.Time
+	Authoritative bool // app-server events do not expire or use terminal heuristics
 }
 
 func getAiStatus(ptyID string) string {
@@ -5578,12 +5610,22 @@ func getAiStatus(ptyID string) string {
 	// Look up by ptyID directly, or scan for matching session
 	if entry, ok := aiStatuses[ptyID]; ok {
 		// Expire stale entries (>15s without update — agent likely interrupted)
-		if time.Since(entry.UpdatedAt) > 15*time.Second {
+		if !entry.Authoritative && time.Since(entry.UpdatedAt) > 15*time.Second {
 			return ""
 		}
 		return entry.Status
 	}
 	return ""
+}
+
+func getAiStatusEntry(ptyID string) (aiStatusEntry, bool) {
+	aiStatusMu.RLock()
+	defer aiStatusMu.RUnlock()
+	entry, ok := aiStatuses[ptyID]
+	if !ok || (!entry.Authoritative && time.Since(entry.UpdatedAt) > 15*time.Second) {
+		return aiStatusEntry{}, false
+	}
+	return entry, true
 }
 
 func setAiStatus(ptyID, status, tool string) {
@@ -5593,6 +5635,25 @@ func setAiStatus(ptyID, status, tool string) {
 		Tool:      tool,
 		UpdatedAt: time.Now(),
 	}
+	aiStatusMu.Unlock()
+	go broadcastPtyState()
+}
+
+func setAiStatusAuthoritative(ptyID, status, tool string) {
+	aiStatusMu.Lock()
+	aiStatuses[ptyID] = aiStatusEntry{
+		Status:        status,
+		Tool:          tool,
+		UpdatedAt:     time.Now(),
+		Authoritative: true,
+	}
+	aiStatusMu.Unlock()
+	go broadcastPtyState()
+}
+
+func clearAiStatus(ptyID string) {
+	aiStatusMu.Lock()
+	delete(aiStatuses, ptyID)
 	aiStatusMu.Unlock()
 	go broadcastPtyState()
 }
