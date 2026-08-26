@@ -720,6 +720,37 @@ func getLocalJWT() string {
 	return tokenString
 }
 
+// cliTLSConfig builds the HTTPS settings used by the local/in-session client.
+// The daemon's server certificate is self-signed by design, so loopback server
+// verification remains disabled as before. When a client identity is
+// configured, both files are mandatory and are loaded before any network I/O
+// so configuration errors are direct and actionable.
+func cliTLSConfig() (*tls.Config, error) {
+	certPath := strings.TrimSpace(os.Getenv(ptyClientCertEnv))
+	keyPath := strings.TrimSpace(os.Getenv(ptyClientKeyEnv))
+	if (certPath == "") != (keyPath == "") {
+		missing := ptyClientCertEnv
+		if certPath != "" {
+			missing = ptyClientKeyEnv
+		}
+		return nil, fmt.Errorf("%s and %s must be configured together for HTTPS: %s is missing", ptyClientCertEnv, ptyClientKeyEnv, missing)
+	}
+
+	config := &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+	}
+	if certPath == "" {
+		return config, nil
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load HTTPS client X509 keypair (%s=%q, %s=%q): %w", ptyClientCertEnv, certPath, ptyClientKeyEnv, keyPath, err)
+	}
+	config.Certificates = []tls.Certificate{pair}
+	return config, nil
+}
+
 // CLI helper: make HTTP request to local daemon
 func cliRequest(method, path string, body []byte) ([]byte, error) {
 	port := os.Getenv("AB_PTY_PORT")
@@ -759,7 +790,11 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	if scheme == "https" {
-		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		tlsConfig, err := cliTLSConfig()
+		if err != nil {
+			return nil, err
+		}
+		client.Transport = &http.Transport{TLSClientConfig: tlsConfig}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1603,6 +1638,8 @@ TLS (all opt-in; the default is plain HTTP, exactly as before):
                                       is aborted before any HTTP is served.
   AB_PTY_TLS_CERT          Server certificate (default: <jwt-secret-dir>/tls/server.crt)
   AB_PTY_TLS_KEY           Server key         (default: <jwt-secret-dir>/tls/server.key)
+  AB_PTY_CLIENT_CERT       Client certificate used by local/in-session HTTPS calls.
+  AB_PTY_CLIENT_KEY        Matching client private key; set both or neither.
   AB_PTY_TLS_ALLOW_LOOPBACK  1 = connections from 127.0.0.1/::1 may skip the
                            client certificate even in required mode (keeps the
                            in-session 'ab' CLI and /api/hook working). Default 0.
@@ -2528,6 +2565,15 @@ func expandPath(path string) string {
 	return path
 }
 
+func appendConfiguredPtyClientIdentity(env []string) []string {
+	for _, key := range []string{ptyClientCertEnv, ptyClientKeyEnv} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
 func createPtySession(projectPath string, rows, cols int, name, continueSession string, shellOnly bool, sessionID string, customCmd []string) (*Session, error) {
 	projectPath = expandPath(projectPath)
 	if info, err := os.Stat(projectPath); err != nil {
@@ -2620,6 +2666,10 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	if port := os.Getenv("AB_PTY_PORT"); port != "" {
 		cmd.Env = append(cmd.Env, "AB_PTY_PORT="+port)
 	}
+	// Required-mode loopback calls still need mutual TLS when the exemption is
+	// disabled. Propagate the daemon-configured local client identity into every
+	// child, including shell sessions whose environment is otherwise minimal.
+	cmd.Env = appendConfiguredPtyClientIdentity(cmd.Env)
 
 	if shouldUseCodexAppServer(customCmd) {
 		sessionEnv := append([]string(nil), cmd.Env...)

@@ -52,6 +52,12 @@ const (
 	// paths, mirroring how AB_PTY_JWT_SECRET_PATH pins the JWT secret.
 	tlsCertEnv = "AB_PTY_TLS_CERT"
 	tlsKeyEnv  = "AB_PTY_TLS_KEY"
+	// AB_PTY_CLIENT_CERT / AB_PTY_CLIENT_KEY identify the certificate the
+	// in-session CLI presents when it calls an HTTPS daemon. They are separate
+	// from the daemon's server keypair above and must always be configured as a
+	// pair.
+	ptyClientCertEnv = "AB_PTY_CLIENT_CERT"
+	ptyClientKeyEnv  = "AB_PTY_CLIENT_KEY"
 	// AB_PTY_TLS_ALLOW_LOOPBACK=1 downgrades "required" to "optional" for
 	// connections originating on 127.0.0.1/::1. Off by default: "required"
 	// means required. See tlsAllowLoopback below for the trade-off.
@@ -608,6 +614,8 @@ Environment:
   AB_PTY_TLS_CERT            server certificate path
   AB_PTY_TLS_KEY             server key path
   AB_PTY_TLS_ALLOW_LOOPBACK  1 = exempt 127.0.0.1/::1 from "required"
+  AB_PTY_CLIENT_CERT         client certificate presented by the local CLI
+  AB_PTY_CLIENT_KEY          matching client private key (set both or neither)
   AB_PTY_DATABASE            SQLite DB holding the client allow-list
 `
 

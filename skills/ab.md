@@ -96,6 +96,10 @@ Default to **send** if unsure — it matches the natural reading of "send to X" 
 - `ab sessions write` does not append Enter; `ab sessions send` does.
 - The session token is bound to YOUR session's lifetime. If your session ends,
   the token stops working.
+- When daemon TLS is `required` and loopback exemption is disabled, configure
+  both `AB_PTY_CLIENT_CERT` and `AB_PTY_CLIENT_KEY` on the daemon. It propagates
+  them into child PTYs, and the in-session CLI presents that certificate on
+  HTTPS calls. The certificate must be present in the daemon client allow-list.
 
 ---
 

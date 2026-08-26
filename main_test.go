@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -86,6 +89,100 @@ func TestHealthEndpoint(t *testing.T) {
 
 	if resp["status"] != "ok" {
 		t.Errorf("Expected status 'ok', got %v", resp["status"])
+	}
+}
+
+func TestCliTLSConfigRequiresCompleteValidKeypair(t *testing.T) {
+	t.Setenv(ptyClientCertEnv, "/tmp/client.crt")
+	t.Setenv(ptyClientKeyEnv, "")
+	if _, err := cliTLSConfig(); err == nil || !strings.Contains(err.Error(), ptyClientKeyEnv+" is missing") {
+		t.Fatalf("expected missing-key error naming %s, got %v", ptyClientKeyEnv, err)
+	}
+
+	t.Setenv(ptyClientCertEnv, "")
+	t.Setenv(ptyClientKeyEnv, "/tmp/client.key")
+	if _, err := cliTLSConfig(); err == nil || !strings.Contains(err.Error(), ptyClientCertEnv+" is missing") {
+		t.Fatalf("expected missing-certificate error naming %s, got %v", ptyClientCertEnv, err)
+	}
+
+	t.Setenv(ptyClientCertEnv, "/tmp/client.crt")
+	t.Setenv(ptyClientKeyEnv, "/tmp/client.key")
+	if _, err := cliTLSConfig(); err == nil || !strings.Contains(err.Error(), "load HTTPS client X509 keypair") {
+		t.Fatalf("expected invalid-keypair error, got %v", err)
+	}
+}
+
+func TestCliRequestPresentsConfiguredClientCertificate(t *testing.T) {
+	dir := t.TempDir()
+	serverCert := filepath.Join(dir, "server.crt")
+	serverKey := filepath.Join(dir, "server.key")
+	clientCert := filepath.Join(dir, "client.crt")
+	clientKey := filepath.Join(dir, "client.key")
+	if err := generateSelfSignedCert(serverCert, serverKey, []string{"localhost"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := generateSelfSignedCert(clientCert, clientKey, []string{"client"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	serverPair, err := tls.LoadX509KeyPair(serverCert, serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	presented := make(chan bool, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		presented <- r.TLS != nil && len(r.TLS.PeerCertificates) == 1
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverPair},
+		ClientAuth:   tls.RequireAnyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tlsModeEnv, TLSModeRequired)
+	t.Setenv("AB_PTY_PORT", port)
+	t.Setenv(ptyClientCertEnv, clientCert)
+	t.Setenv(ptyClientKeyEnv, clientKey)
+
+	body, err := cliRequest(http.MethodGet, "/", nil)
+	if err != nil {
+		t.Fatalf("HTTPS client request failed: %v", err)
+	}
+	if string(body) != "ok" || !<-presented {
+		t.Fatalf("configured client certificate was not presented; body=%q", body)
+	}
+}
+
+func TestCreatePtySessionPropagatesClientCertificateEnvironment(t *testing.T) {
+	initTestDB()
+	sessionsMu.Lock()
+	sessions = make(map[string]*Session)
+	sessionsMu.Unlock()
+
+	t.Setenv(ptyClientCertEnv, "/state/client-certs/local.crt")
+	t.Setenv(ptyClientKeyEnv, "/state/client-certs/local.key")
+	session, err := createPtySession("/tmp", 24, 80, "tls-child", "", true, "pty_tls_env_10001", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer killSession(session.ID)
+
+	env := map[string]string{}
+	for _, entry := range session.Cmd.Env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+	if env[ptyClientCertEnv] != "/state/client-certs/local.crt" || env[ptyClientKeyEnv] != "/state/client-certs/local.key" {
+		t.Fatalf("client identity was not propagated: cert=%q key=%q", env[ptyClientCertEnv], env[ptyClientKeyEnv])
 	}
 }
 
