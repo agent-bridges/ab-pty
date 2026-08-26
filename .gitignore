@@ -3,4 +3,6 @@ data/
 dot-claude/
 .artifacts/
 ab-pty
+ab-pty-mtls
+.ab-pty.lock
 .DS_Store
