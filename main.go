@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -160,7 +161,7 @@ func (s *Session) setWinsize(rows, cols int) {
 // SessionMeta from DB
 type SessionMeta struct {
 	ID        string
-	Label     string
+	Name      string
 	Locked    bool
 	Meta      map[string]interface{}
 	CreatedAt time.Time
@@ -897,73 +898,81 @@ func runCreateSession(args []string) {
 	var result struct {
 		OK        bool   `json:"ok"`
 		SessionID string `json:"session_id"`
+		Name      string `json:"name"`
 		Error     string `json:"error"`
 	}
 	json.Unmarshal(data, &result)
 
 	if result.OK {
-		fmt.Printf("Created session: %s\n", result.SessionID)
+		fmt.Printf("Created session: %s (%s)\n", result.SessionID, result.Name)
 	} else {
 		fmt.Fprintf(os.Stderr, "Failed: %s\n", result.Error)
 		os.Exit(1)
 	}
 }
 
-// runKillSession kills session(s) by ID or name
+type clientSessionIdentity struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Alive bool   `json:"alive"`
+}
+
+func resolveClientSessionTarget(data []byte, target string) (string, error) {
+	var sessions []clientSessionIdentity
+	if len(bytes.TrimSpace(data)) > 0 && bytes.TrimSpace(data)[0] == '[' {
+		if err := json.Unmarshal(data, &sessions); err != nil {
+			return "", fmt.Errorf("parse session list: %w", err)
+		}
+	} else {
+		var result struct {
+			Sessions []clientSessionIdentity `json:"sessions"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			return "", fmt.Errorf("parse session list: %w", err)
+		}
+		sessions = result.Sessions
+	}
+	for _, session := range sessions {
+		if session.ID == target {
+			return session.ID, nil
+		}
+	}
+	var matches []string
+	for _, session := range sessions {
+		if session.Alive && session.Name == target {
+			matches = append(matches, session.ID)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		sort.Strings(matches)
+		return "", fmt.Errorf("session name %q is ambiguous; matches %s", target, strings.Join(matches, ", "))
+	}
+	return "", fmt.Errorf("session %q not found", target)
+}
+
+func resolveClientPtyTarget(target string) (string, error) {
+	data, err := cliRequest(http.MethodGet, "/api/pty", nil)
+	if err != nil {
+		return "", err
+	}
+	return resolveClientSessionTarget(data, target)
+}
+
+// runKillSession kills one session by exact ID or unique live name.
 func runKillSession(target string) {
-	// First get list of sessions
-	data, err := cliRequest("GET", "/api/pty", nil)
+	id, err := resolveClientPtyTarget(target)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-
-	var sessions []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-
-	// Try to parse response
-	var result struct {
-		Sessions []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"sessions"`
-	}
-	if err := json.Unmarshal(data, &result); err == nil {
-		sessions = result.Sessions
-	} else {
-		json.Unmarshal(data, &sessions)
-	}
-
-	// Find matching sessions
-	var toKill []string
-	for _, s := range sessions {
-		if s.ID == target || s.Name == target {
-			toKill = append(toKill, s.ID)
-		}
-	}
-
-	if len(toKill) == 0 {
-		fmt.Fprintf(os.Stderr, "No sessions matching '%s'\n", target)
+	if _, err := cliRequest("DELETE", "/api/pty/"+url.PathEscape(id), nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to kill %s: %v\n", id, err)
 		os.Exit(1)
 	}
-
-	// Kill each matching session
-	killed := 0
-	for _, id := range toKill {
-		_, err := cliRequest("DELETE", "/api/pty/"+id, nil)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to kill %s: %v\n", id, err)
-		} else {
-			fmt.Printf("Killed: %s\n", id)
-			killed++
-		}
-	}
-
-	if killed == 0 {
-		os.Exit(1)
-	}
+	fmt.Printf("Killed: %s\n", id)
 }
 
 // --- In-session client CLI ------------------------------------------------
@@ -983,7 +992,8 @@ Usage:
   ab sessions write  <pty_id|name> "text"             # write only, DO NOT submit — user confirms
   ab sessions key    <pty_id|name> <key>              # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
   ab sessions tail   <pty_id|name> [--lines N]        # alias: peek
-  ab sessions meta   <pty_id|name> [--name N] [--label L] [--set k=v ...]   # --name renames the session
+  ab sessions rename <pty_id|name> <new-name>
+  ab sessions meta   <pty_id|name> [--set k=v ...]
   ab sessions lock   <pty_id|name>
   ab sessions unlock <pty_id|name>
 
@@ -1287,6 +1297,11 @@ func runClientSessions(args []string) {
 	}
 	sub := args[0]
 	rest := args[1:]
+	resolve := func(target string) string {
+		id, err := resolveClientPtyTarget(target)
+		requireOK(err)
+		return id
+	}
 	switch sub {
 	case "list":
 		out, err := cliRequest("GET", "/api/pty", nil)
@@ -1310,8 +1325,9 @@ func runClientSessions(args []string) {
 			fmt.Println(string(out))
 		}
 	case "get":
-		requireArg(rest, 0, "get", "<pty_id>")
-		out, err := cliRequest("GET", "/api/pty/"+rest[0], nil)
+		requireArg(rest, 0, "get", "<pty_id|name>")
+		id := resolve(rest[0])
+		out, err := cliRequest("GET", "/api/pty/"+url.PathEscape(id), nil)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "create":
@@ -1320,13 +1336,14 @@ func runClientSessions(args []string) {
 		// top-level `create` command. Easier: just reuse runCreateSession.
 		runCreateSession(rest)
 	case "kill":
-		requireArg(rest, 0, "kill", "<pty_id>")
-		_, err := cliRequest("DELETE", "/api/pty/"+rest[0], nil)
+		requireArg(rest, 0, "kill", "<pty_id|name>")
+		id := resolve(rest[0])
+		_, err := cliRequest("DELETE", "/api/pty/"+url.PathEscape(id), nil)
 		requireOK(err)
 		fmt.Println(`{"ok":true}`)
 	case "write", "send":
-		requireArg(rest, 1, sub, "<pty_id> <text>")
-		target := rest[0]
+		requireArg(rest, 1, sub, "<pty_id|name> <text>")
+		target := resolve(rest[0])
 		text := rest[1]
 		// Different defaults:
 		//   send  — auto-submit (append Enter). Use "fire-off task" semantics.
@@ -1343,12 +1360,12 @@ func runClientSessions(args []string) {
 			}
 		}
 		body, _ := json.Marshal(map[string]interface{}{"text": text, "enter": enter})
-		out, err := cliRequest("POST", "/api/pty/"+target+"/stdin", body)
+		out, err := cliRequest("POST", "/api/pty/"+url.PathEscape(target)+"/stdin", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "tail", "peek":
-		requireArg(rest, 0, sub, "<pty_id> [--lines N]")
-		target := rest[0]
+		requireArg(rest, 0, sub, "<pty_id|name> [--lines N]")
+		target := resolve(rest[0])
 		lines := 50
 		for i := 1; i < len(rest); i++ {
 			if rest[i] == "--lines" && i+1 < len(rest) {
@@ -1358,28 +1375,18 @@ func runClientSessions(args []string) {
 				i++
 			}
 		}
-		out, err := cliRequest("GET", fmt.Sprintf("/api/pty/%s/scrollback?lines=%d", target, lines), nil)
+		out, err := cliRequest("GET", fmt.Sprintf("/api/pty/%s/scrollback?lines=%d", url.PathEscape(target), lines), nil)
 		requireOK(err)
 		// Pretty-print lines one per row if the caller asked for --raw? v1: just
 		// print the JSON so it stays machine-parseable.
 		fmt.Println(string(out))
 	case "meta":
-		requireArg(rest, 0, "meta", "<pty_id|name> [--name N] [--label L] [--set k=v ...]")
-		target := rest[0]
+		requireArg(rest, 0, "meta", "<pty_id|name> [--set k=v ...]")
+		target := resolve(rest[0])
 		payload := map[string]interface{}{}
 		metaSet := map[string]interface{}{}
 		for i := 1; i < len(rest); i++ {
 			switch rest[i] {
-			case "--name":
-				if i+1 < len(rest) {
-					payload["name"] = rest[i+1]
-					i++
-				}
-			case "--label":
-				if i+1 < len(rest) {
-					payload["label"] = rest[i+1]
-					i++
-				}
 			case "--set":
 				if i+1 < len(rest) {
 					kv := strings.SplitN(rest[i+1], "=", 2)
@@ -1394,25 +1401,34 @@ func runClientSessions(args []string) {
 			payload["meta"] = metaSet
 		}
 		body, _ := json.Marshal(payload)
-		out, err := cliRequest("PATCH", "/api/pty/"+target+"/meta", body)
+		out, err := cliRequest("PATCH", "/api/pty/"+url.PathEscape(target)+"/meta", body)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "rename":
+		requireArg(rest, 1, "rename", "<pty_id|name> <new-name>")
+		id := resolve(rest[0])
+		body, _ := json.Marshal(map[string]string{"name": rest[1]})
+		out, err := cliRequest("PATCH", "/api/pty/"+url.PathEscape(id)+"/name", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "key":
-		requireArg(rest, 1, "key", "<pty_id> <key>  (enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|...)")
-		target := rest[0]
+		requireArg(rest, 1, "key", "<pty_id|name> <key>  (enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|...)")
+		target := resolve(rest[0])
 		keyName := rest[1]
 		body, _ := json.Marshal(map[string]interface{}{"key": keyName})
-		out, err := cliRequest("POST", "/api/pty/"+target+"/key", body)
+		out, err := cliRequest("POST", "/api/pty/"+url.PathEscape(target)+"/key", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "lock":
-		requireArg(rest, 0, "lock", "<pty_id>")
-		out, err := cliRequest("POST", "/api/pty/"+rest[0]+"/lock", nil)
+		requireArg(rest, 0, "lock", "<pty_id|name>")
+		id := resolve(rest[0])
+		out, err := cliRequest("POST", "/api/pty/"+url.PathEscape(id)+"/lock", nil)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "unlock":
-		requireArg(rest, 0, "unlock", "<pty_id>")
-		out, err := cliRequest("DELETE", "/api/pty/"+rest[0]+"/lock", nil)
+		requireArg(rest, 0, "unlock", "<pty_id|name>")
+		id := resolve(rest[0])
+		out, err := cliRequest("DELETE", "/api/pty/"+url.PathEscape(id)+"/lock", nil)
 		requireOK(err)
 		fmt.Println(string(out))
 	default:
@@ -1833,6 +1849,152 @@ func closePtySubscribers() {
 	}
 }
 
+const sessionMetaTableDDL = `
+	CREATE TABLE session_meta (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		locked INTEGER NOT NULL DEFAULT 0,
+		active INTEGER NOT NULL DEFAULT 0,
+		meta TEXT NOT NULL DEFAULT '{}',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`
+
+type persistedSessionMetaRow struct {
+	id        string
+	name      string
+	locked    int
+	active    int
+	meta      string
+	createdAt interface{}
+	updatedAt interface{}
+}
+
+// ensureSessionMetaSchema installs the name-only session identity schema. The
+// previous daemon stored the mutable session name in meta.project_name and a
+// separate display label in session_meta.label. This is the deployment-boundary
+// migration: copy the real name into its own column, discard the label column,
+// and remove project_name from the opaque metadata blob.
+func ensureSessionMetaSchema(database *sql.DB) error {
+	rows, err := database.Query(`PRAGMA table_info(session_meta)`)
+	if err != nil {
+		return fmt.Errorf("inspect session_meta schema: %w", err)
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("inspect session_meta column: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	if len(columns) == 0 {
+		if _, err := database.Exec(sessionMetaTableDDL); err != nil {
+			return fmt.Errorf("create session_meta: %w", err)
+		}
+		_, err := database.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS session_meta_live_name_idx ON session_meta(name) WHERE active = 1`)
+		return err
+	}
+
+	canonical := columns["id"] && columns["name"] && columns["locked"] && columns["active"] && columns["meta"] && columns["created_at"] && columns["updated_at"] && !columns["label"]
+	if canonical {
+		_, err := database.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS session_meta_live_name_idx ON session_meta(name) WHERE active = 1`)
+		return err
+	}
+
+	columnExpr := func(name, fallback string) string {
+		if columns[name] {
+			return name
+		}
+		return fallback
+	}
+	query := fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s FROM session_meta ORDER BY id`,
+		columnExpr("id", `''`), columnExpr("name", `''`), columnExpr("locked", `0`),
+		columnExpr("active", `0`), columnExpr("meta", `'{}'`),
+		columnExpr("created_at", `CURRENT_TIMESTAMP`), columnExpr("updated_at", `CURRENT_TIMESTAMP`))
+	legacyRows, err := database.Query(query)
+	if err != nil {
+		return fmt.Errorf("read legacy session_meta: %w", err)
+	}
+	var saved []persistedSessionMetaRow
+	liveNames := map[string]bool{}
+	for legacyRows.Next() {
+		var row persistedSessionMetaRow
+		if err := legacyRows.Scan(&row.id, &row.name, &row.locked, &row.active, &row.meta, &row.createdAt, &row.updatedAt); err != nil {
+			legacyRows.Close()
+			return fmt.Errorf("scan legacy session_meta: %w", err)
+		}
+		var meta map[string]interface{}
+		if json.Unmarshal([]byte(row.meta), &meta) != nil || meta == nil {
+			meta = map[string]interface{}{}
+		}
+		if strings.TrimSpace(row.name) == "" {
+			row.name, _ = meta["project_name"].(string)
+		}
+		delete(meta, "project_name")
+		if encoded, err := json.Marshal(meta); err == nil {
+			row.meta = string(encoded)
+		}
+		row.name = strings.TrimSpace(row.name)
+		if row.name == "" {
+			projectPath, _ := meta["project_path"].(string)
+			row.name = defaultSessionName(row.id, projectPath)
+		}
+		if row.active != 0 {
+			base := row.name
+			for suffix := 2; liveNames[row.name]; suffix++ {
+				row.name = fmt.Sprintf("%s-%d", base, suffix)
+			}
+			liveNames[row.name] = true
+		}
+		saved = append(saved, row)
+	}
+	if err := legacyRows.Close(); err != nil {
+		return err
+	}
+
+	tx, err := database.Begin()
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS session_meta_name_only`); err != nil {
+		return rollback(err)
+	}
+	if _, err := tx.Exec(strings.Replace(sessionMetaTableDDL, "session_meta", "session_meta_name_only", 1)); err != nil {
+		return rollback(err)
+	}
+	for _, row := range saved {
+		if _, err := tx.Exec(`INSERT INTO session_meta_name_only (id, name, locked, active, meta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			row.id, row.name, row.locked, row.active, row.meta, row.createdAt, row.updatedAt); err != nil {
+			return rollback(err)
+		}
+	}
+	if _, err := tx.Exec(`DROP TABLE session_meta`); err != nil {
+		return rollback(err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE session_meta_name_only RENAME TO session_meta`); err != nil {
+		return rollback(err)
+	}
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX session_meta_live_name_idx ON session_meta(name) WHERE active = 1`); err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func initDB() {
 	// Canonical DB location: /opt/ab/data/sessions.db
 	// Env AB_PTY_DATABASE overrides (used by Docker: /state/pty/sessions.db).
@@ -1866,18 +2028,7 @@ func initDB() {
 		log.Fatal(err)
 	}
 
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS session_meta (
-			id TEXT PRIMARY KEY,
-			label TEXT DEFAULT '',
-			locked INTEGER DEFAULT 0,
-			active INTEGER DEFAULT 0,
-			meta TEXT DEFAULT '{}',
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`)
-	if err != nil {
+	if err = ensureSessionMetaSchema(db); err != nil {
 		log.Fatal(err)
 	}
 
@@ -1911,8 +2062,6 @@ func initDB() {
 		log.Fatal(err)
 	}
 
-	// Migration: add active column if not exists
-	db.Exec(`ALTER TABLE session_meta ADD COLUMN active INTEGER DEFAULT 0`)
 	db.Exec(`ALTER TABLE board_items ADD COLUMN x INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE board_items ADD COLUMN y INTEGER NOT NULL DEFAULT 0`)
 	// Tags are JSON-encoded []string. Free-form labels users attach to items;
@@ -2216,11 +2365,11 @@ func deleteBoardLayout(name string) (bool, error) {
 }
 
 func getSessionMeta(sessionID string) *SessionMeta {
-	row := db.QueryRow("SELECT id, label, locked, meta, created_at, updated_at FROM session_meta WHERE id = ?", sessionID)
+	row := db.QueryRow("SELECT id, name, locked, meta, created_at, updated_at FROM session_meta WHERE id = ?", sessionID)
 	meta := &SessionMeta{}
 	var metaJSON string
 	var locked int
-	err := row.Scan(&meta.ID, &meta.Label, &locked, &metaJSON, &meta.CreatedAt, &meta.UpdatedAt)
+	err := row.Scan(&meta.ID, &meta.Name, &locked, &metaJSON, &meta.CreatedAt, &meta.UpdatedAt)
 	if err != nil {
 		return nil
 	}
@@ -2229,7 +2378,7 @@ func getSessionMeta(sessionID string) *SessionMeta {
 	return meta
 }
 
-func setSessionMeta(sessionID string, label *string, locked *bool, metaUpdate map[string]interface{}) *SessionMeta {
+func setSessionMeta(sessionID string, name *string, locked *bool, metaUpdate map[string]interface{}) *SessionMeta {
 	existing := getSessionMeta(sessionID)
 
 	if existing == nil {
@@ -2238,19 +2387,19 @@ func setSessionMeta(sessionID string, label *string, locked *bool, metaUpdate ma
 			b, _ := json.Marshal(metaUpdate)
 			metaJSON = string(b)
 		}
-		labelVal := ""
-		if label != nil {
-			labelVal = *label
+		nameVal := ""
+		if name != nil {
+			nameVal = *name
 		}
 		lockedVal := 0
 		if locked != nil && *locked {
 			lockedVal = 1
 		}
-		db.Exec("INSERT INTO session_meta (id, label, locked, active, meta) VALUES (?, ?, ?, 1, ?)",
-			sessionID, labelVal, lockedVal, metaJSON)
+		db.Exec("INSERT INTO session_meta (id, name, locked, active, meta) VALUES (?, ?, ?, 1, ?)",
+			sessionID, nameVal, lockedVal, metaJSON)
 	} else {
-		if label != nil {
-			db.Exec("UPDATE session_meta SET label = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", *label, sessionID)
+		if name != nil {
+			db.Exec("UPDATE session_meta SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", *name, sessionID)
 		}
 		if locked != nil {
 			lockedVal := 0
@@ -2287,34 +2436,38 @@ func sessionShortUID(sessionID string) string {
 	return sessionID[idx+1:]
 }
 
-// deriveAutoBase picks a stem for auto-generated session names. Prefers
-// the project directory's basename (e.g. "av-photo" for
-// "/lxd-exch/avito/av-photo") so agents scanning `ab sessions list` can
-// tell sessions apart from the name alone. When the path is a root-ish
-// placeholder ("/", ".", ""), falls back to the host's short name —
-// otherwise every shell opened at the filesystem root would be an
-// indistinguishable "root-XXXXX" blob in the list.
+// deriveAutoBase selects the readable stem used once, when a canonical name
+// is first created. Consumers never call this as a display fallback: after
+// creation the persisted Session.Name is the sole display identity.
 func deriveAutoBase(projectPath string) string {
 	base := filepath.Base(projectPath)
 	if base != "" && base != "." && base != "/" {
 		return base
 	}
-	if hn, err := os.Hostname(); err == nil && hn != "" {
-		return strings.SplitN(hn, ".", 2)[0]
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		return strings.SplitN(hostname, ".", 2)[0]
 	}
 	return "shell"
 }
 
-// legacyGenericNameRe matches names an older code path assigned when the
-// basename of a "/" project path was "" — literal "root", plus the
-// "root-<digits>" shape a later collision-suffix pass produced. When we
-// restore such a session and the current project_path has a real
-// basename, we discard the legacy name so the auto-namer below re-derives
-// from the path. This migrates existing sessions on the next daemon
-// restart with zero manual rename effort. User-picked names that happen
-// to include "root" as a substring (e.g. "root-fs") are unaffected —
-// the regex anchors on the whole string.
-var legacyGenericNameRe = regexp.MustCompile(`^root(-\d+)?$`)
+func defaultSessionName(sessionID, projectPath string) string {
+	base := deriveAutoBase(projectPath)
+	if shortUID := sessionShortUID(sessionID); shortUID != "" {
+		return base + "-" + shortUID
+	}
+	return base + "-" + sessionID
+}
+
+func validateSessionName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("session name must not be empty")
+	}
+	if strings.Contains(name, "/") || strings.ContainsAny(name, "\r\n\x00") {
+		return "", fmt.Errorf("session name must not contain '/', newlines, or NUL")
+	}
+	return name, nil
+}
 
 // findAliveSessionByName returns the ID of the first alive session whose
 // Name matches the argument, or "" if none. Caller already holds no lock —
@@ -2333,32 +2486,35 @@ func findAliveSessionByName(name string) string {
 	return ""
 }
 
-// resolvePtyTarget maps a user-provided identifier (either a `pty_<ts>_<rand>`
-// ID or a session name) to a concrete session ID. Returns the matched session
-// ID and whether a unique alive match was found. Used by CLI subcommands so
-// `ab sessions write rt-scrapper-29335 …` works alongside `ab sessions write
-// pty_1775647145_29335 …`.
-func resolvePtyTarget(arg string) (string, bool) {
-	if arg == "" {
-		return "", false
+func renameSession(sessionID, requestedName string) (string, error) {
+	newName, err := validateSessionName(requestedName)
+	if err != nil {
+		return "", err
 	}
-	sessionsMu.RLock()
-	defer sessionsMu.RUnlock()
-	// Exact ID match wins immediately — it's how the daemon indexes sessions.
-	if _, ok := sessions[arg]; ok {
-		return arg, true
+
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	session, ok := sessions[sessionID]
+	if !ok || !session.IsAlive() {
+		return "", fmt.Errorf("session %q not found", sessionID)
 	}
-	// Otherwise scan for an alive session with the matching Name.
-	var hits []string
-	for id, s := range sessions {
-		if s.IsAlive() && s.Name == arg {
-			hits = append(hits, id)
+	for id, candidate := range sessions {
+		if id != sessionID && candidate.IsAlive() && candidate.Name == newName {
+			return "", fmt.Errorf("session name %q is already in use by %s", newName, id)
 		}
 	}
-	if len(hits) == 1 {
-		return hits[0], true
+	result, err := db.Exec(`UPDATE session_meta SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, newName, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("persist session name: %w", err)
 	}
-	return "", false
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if err != nil {
+			return "", fmt.Errorf("persist session name: %w", err)
+		}
+		return "", fmt.Errorf("persist session name: session metadata row %q not found", sessionID)
+	}
+	session.Name = newName
+	return newName, nil
 }
 
 func expandPath(path string) string {
@@ -2383,6 +2539,19 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	if sessionID == "" {
 		// Generate unique session ID: pty_<timestamp>_<random>
 		sessionID = fmt.Sprintf("pty_%d_%d", time.Now().Unix(), time.Now().UnixNano()%100000)
+	}
+
+	if name == "" {
+		name = defaultSessionName(sessionID, projectPath)
+	} else {
+		var err error
+		name, err = validateSessionName(name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if existing := findAliveSessionByName(name); existing != "" && existing != sessionID {
+		return nil, fmt.Errorf("session name %q is already in use by %s", name, existing)
 	}
 
 	// For shell sessions: pass only the bare minimum so bash --login builds
@@ -2475,38 +2644,6 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 		return nil, fmt.Errorf("path=%s cmd=%v: %w", projectPath, cmd.Args, err)
 	}
 
-	// Resolve the session name. Priority:
-	//   1. Explicit `-name` arg (user picked it on purpose)
-	//   2. Auto-generated `<basename(projectPath)>-<short-uid>` (last 5 digits
-	//      of sessionID's random part — gives a stable, human-readable handle
-	//      that doesn't collide with sibling sessions in the same dir).
-	// In both cases we enforce uniqueness among ALIVE sessions: a clash would
-	// make CLI name-based resolution ambiguous. On clash we add the short-uid
-	// suffix (auto path) or return an error (explicit path) — caller decides.
-	autoBase := deriveAutoBase(projectPath)
-	shortUID := sessionShortUID(sessionID)
-	if name == "" {
-		name = autoBase
-		if shortUID != "" {
-			name = autoBase + "-" + shortUID
-		}
-	}
-	if existing := findAliveSessionByName(name); existing != "" && existing != sessionID {
-		// Collision among alive sessions. Auto-resolved by appending short-uid
-		// if not already present; explicit names that still collide get an
-		// error so the caller can pick a different one.
-		if shortUID != "" && !strings.HasSuffix(name, "-"+shortUID) {
-			name = name + "-" + shortUID
-		}
-		if existing := findAliveSessionByName(name); existing != "" && existing != sessionID {
-			_ = ptmx.Close()
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			stopCodexAppServer(sessionID)
-			return nil, fmt.Errorf("session name %q is already in use by %s", name, existing)
-		}
-	}
-
 	session := &Session{
 		ID:          sessionID,
 		Name:        name,
@@ -2523,14 +2660,25 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 		LastCols:    cols,
 	}
 
+	// Re-check while holding the insertion lock so concurrent creates cannot
+	// both reserve the same live name after the optimistic check above.
 	sessionsMu.Lock()
+	for id, candidate := range sessions {
+		if id != sessionID && candidate.IsAlive() && candidate.Name == name {
+			sessionsMu.Unlock()
+			_ = ptmx.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			stopCodexAppServer(sessionID)
+			return nil, fmt.Errorf("session name %q is already in use by %s", name, id)
+		}
+	}
 	sessions[sessionID] = session
 	sessionsMu.Unlock()
 
 	meta := map[string]interface{}{
 		"last_cwd":     projectPath,
 		"project_path": projectPath,
-		"project_name": name,
 		"shell_only":   shellOnly,
 	}
 	if continueSession != "" {
@@ -2539,7 +2687,7 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	if len(originalCustomCmd) > 0 {
 		meta["launch_cmd"] = originalCustomCmd
 	}
-	setSessionMeta(sessionID, nil, nil, meta)
+	setSessionMeta(sessionID, &name, nil, meta)
 
 	// Start reader goroutine
 	go readPtyLoop(session)
@@ -2871,7 +3019,7 @@ func deactivateSession(sessionID string) {
 // restoreSessions restores active PTY sessions after daemon restart
 // Called only once at startup
 func restoreSessions() {
-	rows, err := db.Query("SELECT id, meta FROM session_meta WHERE active = 1")
+	rows, err := db.Query("SELECT id, name, meta FROM session_meta WHERE active = 1")
 	if err != nil {
 		log.Printf("Failed to query active sessions: %v", err)
 		return
@@ -2880,8 +3028,8 @@ func restoreSessions() {
 
 	restored := 0
 	for rows.Next() {
-		var id, metaStr string
-		if err := rows.Scan(&id, &metaStr); err != nil {
+		var id, name, metaStr string
+		if err := rows.Scan(&id, &name, &metaStr); err != nil {
 			continue
 		}
 
@@ -2905,7 +3053,6 @@ func restoreSessions() {
 
 		lastCwd, _ := meta["last_cwd"].(string)
 		projectPath, _ := meta["project_path"].(string)
-		projectName, _ := meta["project_name"].(string)
 		claudeSessionID, _ := meta["claude_session_id"].(string)
 		launchCmd := stringSliceFromJSON(meta["launch_cmd"])
 
@@ -2918,35 +3065,19 @@ func restoreSessions() {
 			startPath = "~"
 		}
 
-		// Legacy-name migration: pre-fix code set project_name = "root"
-		// when basename of a "/" project_path was empty, and a later
-		// collision-suffix pass turned that into "root-<digits>".
-		// Both leave the session indistinguishable from siblings at the
-		// same cwd. If the current project_path has a real basename, drop
-		// the legacy name so createPtySession's auto-namer re-derives
-		// from the path — one-shot rewrite on the first restore under
-		// the new binary, persisted back into meta.project_name by the
-		// setSessionMeta call in createPtySession.
-		if projectName != "" && legacyGenericNameRe.MatchString(projectName) {
-			if realBase := filepath.Base(projectPath); realBase != "" && realBase != "." && realBase != "/" {
-				log.Printf("restore %s: migrating legacy name %q → derive from project_path %q", id, projectName, projectPath)
-				projectName = ""
-			}
-		}
-
 		// Restore session
 		var (
 			session *Session
 			err     error
 		)
 		if len(launchCmd) > 0 {
-			session, err = createPtySession(startPath, 40, 120, projectName, "", true, id, launchCmd)
+			session, err = createPtySession(startPath, 40, 120, name, "", true, id, launchCmd)
 		} else if shellOnly {
 			// Bash: start in last_cwd
-			session, err = createPtySession(startPath, 40, 120, projectName, "", true, id, nil)
+			session, err = createPtySession(startPath, 40, 120, name, "", true, id, nil)
 		} else if claudeSessionID != "" {
 			// Claude: continue session
-			session, err = createPtySession(startPath, 40, 120, projectName, claudeSessionID, false, id, nil)
+			session, err = createPtySession(startPath, 40, 120, name, claudeSessionID, false, id, nil)
 		} else {
 			// No claude session to continue, mark as inactive
 			deactivateSession(id)
@@ -3042,17 +3173,11 @@ func broadcastPtyState() {
 	for _, s := range sessions {
 		meta := getSessionMeta(s.ID)
 		locked := false
-		label := ""
 		claudeSessionID := ""
-		projectName := ""
 		if meta != nil {
 			locked = meta.Locked
-			label = meta.Label
 			if csid, ok := meta.Meta["claude_session_id"].(string); ok {
 				claudeSessionID = csid
-			}
-			if pn, ok := meta.Meta["project_name"].(string); ok {
-				projectName = pn
 			}
 		}
 
@@ -3119,13 +3244,11 @@ func broadcastPtyState() {
 			"name":              s.Name,
 			"project_path":      s.ProjectPath,
 			"last_cwd":          lastCwd,
-			"project_name":      projectName,
 			"created_at":        s.CreatedAt.Format(time.RFC3339),
 			"clients":           clientCount,
 			"alive":             s.IsAlive(),
 			"type":              sessionType,
 			"locked":            locked,
-			"label":             label,
 			"claude_session_id": claudeSessionID,
 			"processes":         processes,
 			"ai_status":         aiSt,
@@ -3948,6 +4071,14 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "Invalid JSON")
 			return
 		}
+		if _, exists := data["label"]; exists {
+			writeError(w, http.StatusBadRequest, "session label is not supported; use name")
+			return
+		}
+		if _, exists := data["project_name"]; exists {
+			writeError(w, http.StatusBadRequest, "project_name is not a session identity field; use name")
+			return
+		}
 
 		projectPath, _ := data["project_path"].(string)
 		if projectPath == "" {
@@ -3957,7 +4088,6 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 		cols := int(getFloat(data, "cols", 120))
 		shellOnly, _ := data["shell_only"].(bool)
 		name, _ := data["name"].(string)
-		projectName, _ := data["project_name"].(string)
 		continueSession, _ := data["continue_session"].(string)
 
 		// Parse custom command if provided
@@ -3979,10 +4109,6 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 
 		session, err := createPtySession(projectPath, rows, cols, name, continueSession, shellOnly, "", customCmd)
 
-		// Save project_name in meta if provided
-		if session != nil && projectName != "" {
-			setSessionMeta(session.ID, nil, nil, map[string]interface{}{"project_name": projectName})
-		}
 		if session == nil {
 			details := "unknown create error"
 			if err != nil {
@@ -3998,10 +4124,13 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 
 		go broadcastPtyState()
 
+		sessionsMu.RLock()
+		createdName := session.Name
+		sessionsMu.RUnlock()
 		writeJSON(w, 0, map[string]interface{}{
 			"ok":           true,
 			"session_id":   session.ID,
-			"name":         session.Name,
+			"name":         createdName,
 			"project_path": session.ProjectPath,
 			"type":         map[bool]string{true: "bash", false: "claude"}[session.ShellOnly],
 		})
@@ -4015,11 +4144,9 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 	for _, s := range sessions {
 		meta := getSessionMeta(s.ID)
 		locked := false
-		label := ""
 		metaData := map[string]interface{}{}
 		if meta != nil {
 			locked = meta.Locked
-			label = meta.Label
 			metaData = meta.Meta
 		}
 
@@ -4043,7 +4170,6 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 			"alive":           s.IsAlive(),
 			"type":            sessionType,
 			"locked":          locked,
-			"label":           label,
 			"meta":            metaData,
 		})
 	}
@@ -4057,7 +4183,8 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse path: /api/pty/{session_id}[/lock|/meta]
+	// Parse path: /api/pty/{session_id}[/lock|/meta|/name]. HTTP routing is
+	// deliberately ID-only; name resolution belongs to the convenience CLI.
 	path := r.URL.Path[len("/api/pty/"):]
 	parts := filepath.SplitList(path)
 	if len(parts) == 0 {
@@ -4078,15 +4205,52 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 	if sessionID == "" {
 		sessionID = path
 	}
+	if decoded, err := url.PathUnescape(sessionID); err == nil {
+		sessionID = decoded
+	}
 
-	// Allow name-based addressing alongside the canonical pty_<ts>_<rand> id.
-	// `ab sessions write rt-scrapper-29335 …` hits this endpoint with the name
-	// in the path; resolve it to the underlying ID before routing the action.
-	if resolved, ok := resolvePtyTarget(sessionID); ok {
-		sessionID = resolved
+	sessionsMu.RLock()
+	_, exists := sessions[sessionID]
+	sessionsMu.RUnlock()
+	if !exists {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("session id %q not found", sessionID))
+		return
 	}
 
 	switch {
+	case action == "" && r.Method == http.MethodGet:
+		sessionsMu.RLock()
+		session := sessions[sessionID]
+		sessionName := session.Name
+		sessionsMu.RUnlock()
+		meta := getSessionMeta(sessionID)
+		locked := false
+		metaData := map[string]interface{}{}
+		if meta != nil {
+			locked = meta.Locked
+			metaData = meta.Meta
+		}
+		sessionType := "claude"
+		if session.ShellOnly {
+			sessionType = "bash"
+		}
+		session.mu.RLock()
+		clientCount := len(session.Clients)
+		scrollbackSize := len(session.Scrollback)
+		session.mu.RUnlock()
+		writeJSON(w, 0, map[string]interface{}{
+			"id":              session.ID,
+			"name":            sessionName,
+			"project_path":    session.ProjectPath,
+			"created_at":      session.CreatedAt.Format(time.RFC3339),
+			"clients":         clientCount,
+			"scrollback_size": scrollbackSize,
+			"alive":           session.IsAlive(),
+			"type":            sessionType,
+			"locked":          locked,
+			"meta":            metaData,
+		})
+
 	case action == "lock" && r.Method == "POST":
 		locked := true
 		setSessionMeta(sessionID, nil, &locked, nil)
@@ -4101,46 +4265,59 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 
 	case action == "meta" && r.Method == "PATCH":
 		var data map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&data)
-
-		var label *string
-		if l, ok := data["label"].(string); ok {
-			label = &l
+		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+		if _, exists := data["label"]; exists {
+			writeError(w, http.StatusBadRequest, "session label is not supported; use name")
+			return
+		}
+		if _, exists := data["name"]; exists {
+			writeError(w, http.StatusBadRequest, "use PATCH /api/pty/{id}/name to rename a session")
+			return
 		}
 		var metaUpdate map[string]interface{}
 		if m, ok := data["meta"].(map[string]interface{}); ok {
 			metaUpdate = m
 		}
-
-		// Optional rename via `name`. Canonical mutable identifier — must stay
-		// unique among alive sessions so CLI name-based addressing is
-		// unambiguous. The change touches both in-memory Session.Name (used by
-		// list JSON) and the persisted meta.project_name (used by
-		// restoreSessions after a daemon restart).
-		if newName, ok := data["name"].(string); ok && newName != "" {
-			if existing := findAliveSessionByName(newName); existing != "" && existing != sessionID {
-				writeError(w, 409, fmt.Sprintf("session name %q is already in use by %s", newName, existing))
+		for _, reserved := range []string{"id", "name", "label", "project_name"} {
+			if _, exists := metaUpdate[reserved]; exists {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("meta.%s is reserved", reserved))
 				return
 			}
-			sessionsMu.Lock()
-			if s, ok := sessions[sessionID]; ok {
-				s.Name = newName
-			}
-			sessionsMu.Unlock()
-			if metaUpdate == nil {
-				metaUpdate = map[string]interface{}{}
-			}
-			metaUpdate["project_name"] = newName
 		}
 
-		meta := setSessionMeta(sessionID, label, nil, metaUpdate)
-		resp := map[string]interface{}{"ok": true, "label": meta.Label, "meta": meta.Meta}
+		meta := setSessionMeta(sessionID, nil, nil, metaUpdate)
+		resp := map[string]interface{}{"ok": true, "id": sessionID, "meta": meta.Meta}
 		sessionsMu.RLock()
 		if s, ok := sessions[sessionID]; ok {
 			resp["name"] = s.Name
 		}
 		sessionsMu.RUnlock()
 		writeJSON(w, 0, resp)
+
+	case action == "name" && r.Method == "PATCH":
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+		name, err := renameSession(sessionID, body.Name)
+		if err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "already in use") {
+				status = http.StatusConflict
+			} else if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		go broadcastPtyState()
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "id": sessionID, "name": name})
 
 	case action == "stdin" && r.Method == "POST":
 		// Write raw text into a session's PTY master. Used by the in-session
@@ -4647,6 +4824,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		sessionsMu.RLock()
 		oldSession, exists := sessions[ptyID]
+		oldName := ""
+		if exists {
+			oldName = oldSession.Name
+		}
 		sessionsMu.RUnlock()
 
 		if !exists {
@@ -4666,8 +4847,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if startPath == "" {
 			startPath = oldSession.ProjectPath
 		}
-		oldName := oldSession.Name
-
 		killSession(ptyID)
 		session, createErr = createPtySession(startPath, rows, cols, oldName, claudeSessionID, false, ptyID, nil)
 		pendingScrollback = false
@@ -4680,6 +4859,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		sessionsMu.RLock()
 		oldSession, exists := sessions[ptyID]
+		oldName := ""
+		if exists {
+			oldName = oldSession.Name
+		}
 		sessionsMu.RUnlock()
 
 		if !exists {
@@ -4693,7 +4876,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			claudeSessionID, _ = meta.Meta["claude_session_id"].(string)
 		}
 
-		session, createErr = createPtySession(oldSession.ProjectPath, rows, cols, oldSession.Name, claudeSessionID, false, "", nil)
+		session, createErr = createPtySession(oldSession.ProjectPath, rows, cols, oldName, claudeSessionID, false, "", nil)
 
 	case "attach":
 		if ptyID == "" {
@@ -4773,10 +4956,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		session.mu.Unlock()
 	}()
 
+	sessionsMu.RLock()
+	readyName := session.Name
+	sessionsMu.RUnlock()
 	conn.WriteJSON(map[string]interface{}{
 		"type":         "ready",
 		"session_id":   session.ID,
-		"name":         session.Name,
+		"name":         readyName,
 		"project_path": session.ProjectPath,
 	})
 

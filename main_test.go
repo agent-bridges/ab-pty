@@ -56,7 +56,7 @@ func initTestDB() {
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS session_meta (
 			id TEXT PRIMARY KEY,
-			label TEXT DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
 			locked INTEGER DEFAULT 0,
 			active INTEGER DEFAULT 1,
 			meta TEXT DEFAULT '{}',
@@ -236,14 +236,14 @@ func TestSessionMeta(t *testing.T) {
 	initTestDB() // Reset DB
 
 	// Test create
-	label := "test-label"
-	meta := setSessionMeta("test-session-1", &label, nil, nil)
+	name := "test-name"
+	meta := setSessionMeta("test-session-1", &name, nil, nil)
 
 	if meta == nil {
 		t.Fatal("Expected meta to be created")
 	}
-	if meta.Label != "test-label" {
-		t.Errorf("Expected label 'test-label', got '%s'", meta.Label)
+	if meta.Name != "test-name" {
+		t.Errorf("Expected name 'test-name', got '%s'", meta.Name)
 	}
 
 	// Test lock
@@ -273,8 +273,104 @@ func TestSessionMeta(t *testing.T) {
 	if meta == nil {
 		t.Fatal("Expected to get session meta")
 	}
-	if meta.Label != "test-label" {
-		t.Errorf("Expected label 'test-label', got '%s'", meta.Label)
+	if meta.Name != "test-name" {
+		t.Errorf("Expected name 'test-name', got '%s'", meta.Name)
+	}
+}
+
+func TestEnsureSessionMetaSchemaMigratesNameAndDropsLabel(t *testing.T) {
+	legacyDB, err := sql.Open("sqlite3", "file:abpty_legacy_schema?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyDB.Close()
+	if _, err := legacyDB.Exec(`
+		CREATE TABLE session_meta (
+			id TEXT PRIMARY KEY,
+			label TEXT DEFAULT '',
+			locked INTEGER DEFAULT 0,
+			active INTEGER DEFAULT 0,
+			meta TEXT DEFAULT '{}',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		INSERT INTO session_meta (id, label, active, meta)
+		VALUES ('pty_1_12345', 'discard-me', 1, '{"project_name":"persisted-name","project_path":"/tmp/project","shell_only":true}')
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureSessionMetaSchema(legacyDB); err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+
+	columns := map[string]bool{}
+	rows, err := legacyDB.Query(`PRAGMA table_info(session_meta)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		columns[name] = true
+	}
+	rows.Close()
+	if !columns["name"] || columns["label"] {
+		t.Fatalf("expected name-only identity schema, columns=%v", columns)
+	}
+
+	var name, metaJSON string
+	if err := legacyDB.QueryRow(`SELECT name, meta FROM session_meta WHERE id = 'pty_1_12345'`).Scan(&name, &metaJSON); err != nil {
+		t.Fatal(err)
+	}
+	if name != "persisted-name" {
+		t.Fatalf("expected migrated name, got %q", name)
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal([]byte(metaJSON), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := meta["project_name"]; exists {
+		t.Fatalf("legacy project_name identity was retained: %s", metaJSON)
+	}
+	if _, err := legacyDB.Exec(`INSERT INTO session_meta (id, name, active) VALUES ('pty_1_99999', 'persisted-name', 1)`); err == nil {
+		t.Fatal("live-name uniqueness index was not installed")
+	}
+}
+
+func TestDefaultSessionNameUsesProjectBasename(t *testing.T) {
+	if got := defaultSessionName("pty_123_45678", "/work/readable-project"); got != "readable-project-45678" {
+		t.Fatalf("unexpected generated name %q", got)
+	}
+}
+
+func TestResolveClientSessionTargetUsesExactIDThenUniqueLiveName(t *testing.T) {
+	data := []byte(`[
+		{"id":"pty_exact","name":"old","alive":false},
+		{"id":"pty_live","name":"pty_exact","alive":true},
+		{"id":"pty_named","name":"worker","alive":true},
+		{"id":"pty_dead","name":"worker","alive":false}
+	]`)
+	if got, err := resolveClientSessionTarget(data, "pty_exact"); err != nil || got != "pty_exact" {
+		t.Fatalf("exact id did not win: got=%q err=%v", got, err)
+	}
+	if got, err := resolveClientSessionTarget(data, "worker"); err != nil || got != "pty_named" {
+		t.Fatalf("unique live name did not resolve: got=%q err=%v", got, err)
+	}
+	if _, err := resolveClientSessionTarget(data, "missing"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing name did not fail explicitly: %v", err)
+	}
+
+	ambiguous := []byte(`{"sessions":[
+		{"id":"pty_a","name":"worker","alive":true},
+		{"id":"pty_b","name":"worker","alive":true}
+	]}`)
+	if _, err := resolveClientSessionTarget(ambiguous, "worker"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous live name did not fail explicitly: %v", err)
 	}
 }
 
@@ -425,7 +521,7 @@ func TestPtyDeleteAPI(t *testing.T) {
 	}
 }
 
-func TestPtyMetaUpdateAPI(t *testing.T) {
+func TestPtyMetaUpdateAPIRejectsSessionLabel(t *testing.T) {
 	initTestDB()
 
 	// Create session
@@ -439,22 +535,133 @@ func TestPtyMetaUpdateAPI(t *testing.T) {
 	}
 	defer killSession(session.ID)
 
-	// Update meta
+	// Session label is no longer part of the contract.
 	body := strings.NewReader(`{"label":"my-label","meta":{"custom":"value"}}`)
 	req := httptest.NewRequest("PATCH", "/api/pty/test-meta-session/meta", body)
 	w := httptest.NewRecorder()
 	handlePtyAPI(w, req)
 
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Expected status 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"label":"my-label"`) {
+		t.Fatalf("response retained the removed session label: %s", w.Body.String())
+	}
+}
 
-	if resp["label"] != "my-label" {
-		t.Errorf("Expected label='my-label', got %v", resp["label"])
+func TestPtyCreateAPIRejectsLegacyIdentityFields(t *testing.T) {
+	for _, body := range []string{
+		`{"project_path":"/tmp","shell_only":true,"label":"legacy"}`,
+		`{"project_path":"/tmp","shell_only":true,"project_name":"legacy"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/pty", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		handleListPty(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected legacy identity field rejection, status=%d body=%s", w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestPtyRenameAPIIsUniqueAndPersistent(t *testing.T) {
+	initTestDB()
+	sessionsMu.Lock()
+	sessions = make(map[string]*Session)
+	sessionsMu.Unlock()
+
+	first, err := createPtySession("/tmp", 24, 80, "alpha", "", true, "pty_rename_10001", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer killSession(first.ID)
+	second, err := createPtySession("/tmp", 24, 80, "beta", "", true, "pty_rename_10002", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer killSession(second.ID)
+
+	// HTTP accepts only the canonical id, never a session name.
+	req := httptest.NewRequest(http.MethodPatch, "/api/pty/alpha/name", strings.NewReader(`{"name":"gamma"}`))
+	w := httptest.NewRecorder()
+	handlePtyAPI(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected name-routed API request to fail, status=%d body=%s", w.Code, w.Body.String())
 	}
 
-	meta := resp["meta"].(map[string]interface{})
+	req = httptest.NewRequest(http.MethodPatch, "/api/pty/"+first.ID+"/name", strings.NewReader(`{"name":"gamma"}`))
+	w = httptest.NewRecorder()
+	handlePtyAPI(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("rename failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["id"] != first.ID || resp["name"] != "gamma" {
+		t.Fatalf("unexpected rename response: %v", resp)
+	}
+	if _, exists := resp["label"]; exists {
+		t.Fatalf("rename response exposed removed label: %v", resp)
+	}
+	if persisted := getSessionMeta(first.ID); persisted == nil || persisted.Name != "gamma" {
+		t.Fatalf("renamed name was not persisted: %#v", persisted)
+	}
+	sessionsMu.RLock()
+	if sessions[first.ID].Name != "gamma" {
+		t.Fatalf("in-memory name was not updated: %q", sessions[first.ID].Name)
+	}
+	sessionsMu.RUnlock()
+
+	req = httptest.NewRequest(http.MethodPatch, "/api/pty/"+first.ID+"/name", strings.NewReader(`{"name":"beta"}`))
+	w = httptest.NewRecorder()
+	handlePtyAPI(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected duplicate rename conflict, status=%d body=%s", w.Code, w.Body.String())
+	}
+	if persisted := getSessionMeta(first.ID); persisted == nil || persisted.Name != "gamma" {
+		t.Fatalf("failed rename changed persisted name: %#v", persisted)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "/api/pty/"+first.ID+"/name", strings.NewReader(`{"name":"   "}`))
+	w = httptest.NewRecorder()
+	handlePtyAPI(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected empty rename rejection, status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestPtyMetaUpdatePayloadHasOnlyCanonicalIdentity(t *testing.T) {
+	initTestDB()
+	sessionsMu.Lock()
+	sessions = make(map[string]*Session)
+	sessionsMu.Unlock()
+
+	session, err := createPtySession("/tmp", 24, 80, "canonical", "", true, "pty_meta_10001", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer killSession(session.ID)
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/pty/"+session.ID+"/meta", strings.NewReader(`{"meta":{"custom":"value"}}`))
+	w := httptest.NewRecorder()
+	handlePtyAPI(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("meta update failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["id"] != session.ID || resp["name"] != session.Name {
+		t.Fatalf("canonical identity missing: %v", resp)
+	}
+	if _, exists := resp["label"]; exists {
+		t.Fatalf("meta response exposed removed label: %v", resp)
+	}
+	meta, _ := resp["meta"].(map[string]interface{})
 	if meta["custom"] != "value" {
-		t.Errorf("Expected meta.custom='value', got %v", meta["custom"])
+		t.Fatalf("metadata update missing: %v", resp)
 	}
 }
 
@@ -492,6 +699,19 @@ func TestListPtyWithSession(t *testing.T) {
 
 	if resp[0]["alive"] != true {
 		t.Errorf("Expected alive=true, got %v", resp[0]["alive"])
+	}
+	if resp[0]["name"] != "test-session" {
+		t.Errorf("Expected name='test-session', got %v", resp[0]["name"])
+	}
+	if _, exists := resp[0]["label"]; exists {
+		t.Fatalf("REST payload exposed removed label: %v", resp[0])
+	}
+	if _, exists := resp[0]["project_name"]; exists {
+		t.Fatalf("REST payload exposed duplicate project_name identity: %v", resp[0])
+	}
+	meta, _ := resp[0]["meta"].(map[string]interface{})
+	if _, exists := meta["project_name"]; exists {
+		t.Fatalf("REST metadata retained duplicate project_name identity: %v", resp[0])
 	}
 }
 
@@ -549,6 +769,53 @@ func TestWebSocketPtyState(t *testing.T) {
 
 	if pong["type"] != "pong" {
 		t.Errorf("Expected type='pong', got %v", pong["type"])
+	}
+}
+
+func TestWebSocketPtyStateUsesNameOnlyIdentity(t *testing.T) {
+	initTestDB()
+	sessionsMu.Lock()
+	sessions = make(map[string]*Session)
+	sessionsMu.Unlock()
+	resetStateSubs()
+
+	session, err := createPtySession("/tmp", 24, 80, "ws-name", "", true, "pty_ws_10001", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer killSession(session.ID)
+
+	server := httptest.NewServer(http.HandlerFunc(handlePtyState))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, msg, err := ws.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Sessions []map[string]interface{} `json:"sessions"`
+	}
+	if err := json.Unmarshal(msg, &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 1 {
+		t.Fatalf("expected one session, got %s", msg)
+	}
+	payload := state.Sessions[0]
+	if payload["id"] != session.ID || payload["name"] != "ws-name" {
+		t.Fatalf("canonical websocket identity missing: %v", payload)
+	}
+	if _, exists := payload["label"]; exists {
+		t.Fatalf("websocket payload exposed removed label: %v", payload)
+	}
+	if _, exists := payload["project_name"]; exists {
+		t.Fatalf("websocket payload exposed duplicate project_name identity: %v", payload)
 	}
 }
 

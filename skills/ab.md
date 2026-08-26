@@ -16,7 +16,7 @@ Use `ab` to orchestrate sibling sessions on THIS host.
 ## Quick menu (present this to the user)
 
 - **list sessions** — show all peer sessions
-- **create session <name>** — spawn a new session labelled `<name>`
+- **create session <name>** — spawn a new session named `<name>`
 - **send to <name>: <message>** — fire a message at the peer and auto-submit it (this is the default for "send", "tell", "ask", "forward", "message", and any other verb that means the peer should ACT on the text)
 - **write draft to <name>: <message>** — (rare) prefill the peer's input without submitting. Use ONLY when the user explicitly says "draft", "prefill", "prepare without sending", "don't press enter yet", or similar.
 - **key <name> <key>** — press a key in peer (enter, ctrl-c, tab, arrows, …)
@@ -28,33 +28,34 @@ Use `ab` to orchestrate sibling sessions on THIS host.
 ## Subcommands
 
 - `ab sessions list` — JSON array of all sessions on this daemon.
-- `ab sessions get <pty_id>` — JSON details for one session.
+- `ab sessions get <pty_id|name>` — JSON details for one session.
 - `ab sessions create -shell -project <cwd> -name <name>` — create a shell session.
-- `ab sessions send  <pty_id> "<text>"` — write text AND press Enter. Auto-submits. Use when the user wants the peer agent to act on the text IMMEDIATELY ("tell dev1 to …", "ask dev2 for …"). Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
-- `ab sessions write <pty_id> "<text>"` — write text ONLY, no Enter. The peer's input box is pre-filled; a human (or another explicit call) decides when to submit / edit the text. Use when the user wants to "draft" or "prefill" a message ("prepare a task for dev1 but let me review before sending").
-- `ab sessions key <pty_id> <key>` — send an explicit key press. Supported: `enter`, `tab`, `esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `ctrl-c`, `ctrl-d`, `ctrl-z`, `ctrl-l`, `ctrl-u`, `ctrl-w`. Use to interrupt a running command (`ctrl-c`), navigate a TUI menu (arrows + `enter`), or submit a previously-drafted `write` (`enter`).
-- `ab sessions tail  <pty_id> --lines 50` — read recent scrollback as JSON.
-- `ab sessions kill  <pty_id>` — terminate a session.
-- `ab sessions meta  <pty_id> --label <L> [--set k=v ...]` — set the **display label** (what the user sees on the canvas).
-- `ab sessions lock <pty_id>` / `ab sessions unlock <pty_id>`.
+- `ab sessions send  <pty_id|name> "<text>"` — write text AND press Enter. Auto-submits. Use when the user wants the peer agent to act on the text IMMEDIATELY ("tell dev1 to …", "ask dev2 for …"). Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
+- `ab sessions write <pty_id|name> "<text>"` — write text ONLY, no Enter. The peer's input box is pre-filled; a human (or another explicit call) decides when to submit / edit the text. Use when the user wants to "draft" or "prefill" a message ("prepare a task for dev1 but let me review before sending").
+- `ab sessions key <pty_id|name> <key>` — send an explicit key press. Supported: `enter`, `tab`, `esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `ctrl-c`, `ctrl-d`, `ctrl-z`, `ctrl-l`, `ctrl-u`, `ctrl-w`. Use to interrupt a running command (`ctrl-c`), navigate a TUI menu (arrows + `enter`), or submit a previously-drafted `write` (`enter`).
+- `ab sessions tail  <pty_id|name> --lines 50` — read recent scrollback as JSON.
+- `ab sessions kill  <pty_id|name>` — terminate a session.
+- `ab sessions rename <pty_id|name> <new-name>` — change the sole mutable/displayed session name.
+- `ab sessions meta <pty_id|name> [--set k=v ...]` — update non-identity metadata.
+- `ab sessions lock <pty_id|name>` / `ab sessions unlock <pty_id|name>`.
 
-## Display label vs. -name
+## Session identity
 
-When creating a session with a **user-visible name** like "s1" / "dev1" / "test":
+Every session has exactly two public identity fields:
 
-1. Create: `ab sessions create -shell -project /tmp -name s1` → get `<pty_id>`.
-2. Then **set the display label** so the canvas shows it:
-   `ab sessions meta <pty_id> --label s1`
+- `id` — immutable, daemon-generated, and the only value accepted in HTTP paths.
+- `name` — unique among live sessions and the only mutable/displayed name.
 
-Without step 2, the canvas derives the label from the cwd (e.g. `tmp-#XXXXXX`) and
-ignores the internal `-name`. Always run both steps when the user asked for a
-named session.
+Create a named session in one step: `ab sessions create -shell -project /tmp -name s1`.
+Rename it with `ab sessions rename s1 dev1`. Do not derive a display identity
+from cwd, project basename, board state, or metadata after creation.
 
 ## Resolving names → pty_id
 
-The user will reference sessions by their human name (e.g. "dev1", "test"),
-but all write/tail/kill commands need the opaque `pty_XXX` id. Always resolve
-via list first:
+The CLI accepts an exact PTY ID or a unique live session name. It lists sessions,
+lets an exact ID win, otherwise requires exactly one live matching name, and
+then sends the daemon an ID-routed request. Missing or ambiguous names fail.
+For direct HTTP calls, resolve the name first:
 
 ```
 ab sessions list | jq -r '.[] | select(.name=="dev1") | .id'
@@ -66,8 +67,8 @@ If `jq` isn't available, grep the JSON and extract the `id` field.
 
 | User says                                  | You run                                                                                         |
 | ------------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| "create ab session test"                   | `ab sessions create -shell -project /tmp -name test` → grab id → `ab sessions meta <id> --label test` |
-| "create sessions s1, s2, s3"               | loop each name: create + meta --label                                                           |
+| "create ab session test"                   | `ab sessions create -shell -project /tmp -name test`                                            |
+| "create sessions s1, s2, s3"               | loop each name with `sessions create ... -name <name>`                                           |
 | "list sessions"                            | `ab sessions list`                                                                     |
 | "send to dev1: …"                          | resolve dev1 → `ab sessions send  <id> "..."`                                   |
 | "write to dev1: …" / "message dev1 …"      | resolve dev1 → `ab sessions send  <id> "..."`  ← still send (auto-submit)        |
@@ -77,7 +78,7 @@ If `jq` isn't available, grep the JSON and extract the `id` field.
 | "tell dev1 to stop" / "cancel dev1"        | resolve dev1 → `ab sessions key  <id> ctrl-c`                                        |
 | "tail dev1 last 40 lines"                  | resolve dev1 → `ab sessions tail <id> --lines 40`                                   |
 | "kill test session"                        | resolve test → `ab sessions kill <id>`                                                |
-| "rename session <id> to dev2"              | `ab sessions meta <id> --label dev2`                                                  |
+| "rename session <id> to dev2"              | `ab sessions rename <id> dev2`                                                         |
 
 ## send vs write — pick the right one
 
@@ -92,8 +93,7 @@ Default to **send** if unsure — it matches the natural reading of "send to X" 
 
 - `ab` only reaches sessions on the SAME PTY daemon as yours (v1). To send to
   a session on a different host, ask the user to configure cross-daemon peering.
-- `ab sessions write` appends Enter by default — the receiving session sees
-  exactly what a human would see after typing + pressing Return.
+- `ab sessions write` does not append Enter; `ab sessions send` does.
 - The session token is bound to YOUR session's lifetime. If your session ends,
   the token stops working.
 
@@ -123,29 +123,22 @@ Given the project root (`$PROJECT_ROOT` = `$CWD` at the moment the user invokes 
 
 3. **Spawn N sessions** in parallel via `Bash`. Each session's `-project` is its own role-dir, NOT the project root:
    ```
-   ab sessions create -shell -project $PROJECT_ROOT/_team/<prefix>-front -name front
-   ab sessions create -shell -project $PROJECT_ROOT/_team/<prefix>-back  -name back
-   ab sessions create -shell -project $PROJECT_ROOT/_team/<prefix>-qa    -name qa
+   ab sessions create -shell -project $PROJECT_ROOT/_team/<prefix>-front -name <prefix>-front
+   ab sessions create -shell -project $PROJECT_ROOT/_team/<prefix>-back  -name <prefix>-back
+   ab sessions create -shell -project $PROJECT_ROOT/_team/<prefix>-qa    -name <prefix>-qa
    ```
    Capture each `pty_id`.
 
-4. **Set namespaced labels** so multiple projects can coexist on one host:
-   ```
-   ab sessions meta <front_pty>  --label <prefix>-front
-   ab sessions meta <back_pty>   --label <prefix>-back
-   ab sessions meta <qa_pty>     --label <prefix>-qa
-   ```
+4. **Launch the worker agent** in each session per the **launch matrix** below. **Never launch a vanilla "low-permissions" CLI** — workers run in dangerous/full-access mode because the orchestrator is the trust boundary, not them. If the user specifies a flavour for a role (e.g. "front=codex, qa=gemini"), use the matching row.
 
-5. **Launch the worker agent** in each session per the **launch matrix** below. **Never launch a vanilla "low-permissions" CLI** — workers run in dangerous/full-access mode because the orchestrator is the trust boundary, not them. If the user specifies a flavour for a role (e.g. "front=codex, qa=gemini"), use the matching row.
+5. **Wait ~6 s** for the welcome banner, verify with `ab sessions tail <pty> --lines 5`.
 
-6. **Wait ~6 s** for the welcome banner, verify with `ab sessions tail <pty> --lines 5`.
+6. **Drop `TEAM_PROTOCOL.md`** at the project root (`$PROJECT_ROOT/TEAM_PROTOCOL.md`) by copying the "Worker protocol" section below with placeholders filled. Use the `Write` tool, not bash heredoc.
 
-7. **Drop `TEAM_PROTOCOL.md`** at the project root (`$PROJECT_ROOT/TEAM_PROTOCOL.md`) by copying the "Worker protocol" section below with placeholders filled. Use the `Write` tool, not bash heredoc.
-
-8. **Brief each worker** (one-shot `ab sessions send`). EVERY brief MUST include both the role-dir (their cwd) AND the project root, so they don't confuse the two:
+7. **Brief each worker** (one-shot `ab sessions send`). EVERY brief MUST include both the role-dir (their cwd) AND the project root, so they don't confuse the two:
    - "You are <ROLE> in the `<prefix>` team. Your session cwd is `<PROJECT_ROOT>/_team/<prefix>-<role>/` (your scratch / conversation home). The actual project root is `<PROJECT_ROOT>` — that's where source lives, where you read/write code. Read `<PROJECT_ROOT>/TEAM_PROTOCOL.md` (full), send a STARTED status, then sit silent until a task arrives. Teamlead pty_id is `<TEAMLEAD_PTY_ID>`. No heartbeats."
 
-9. **Do not schedule wakeups** unless an actual task is in flight. Idle workers stay silent; teamlead stays silent until the user dispatches real work.
+8. **Do not schedule wakeups** unless an actual task is in flight. Idle workers stay silent; teamlead stays silent until the user dispatches real work.
 
 ---
 
@@ -195,14 +188,14 @@ This protocol is **agent-agnostic** — every worker (Claude Code, Codex CLI, Ge
 
 ## Roster
 
-| Role | Label | pty_id | Agent flavour |
+| Role | Name | pty_id | Agent flavour |
 |---|---|---|---|
 | **Teamlead** (orchestrator) | `teamlead` | `<TEAMLEAD_PTY_ID>` | <TEAMLEAD_FLAVOUR> |
 | **Frontend** | `<PREFIX>-front` | `<FRONT_PTY_ID>` | <FRONT_FLAVOUR> |
 | **Backend** | `<PREFIX>-back` | `<BACK_PTY_ID>` | <BACK_FLAVOUR> |
 | **QA** | `<PREFIX>-qa` | `<QA_PTY_ID>` | <QA_FLAVOUR> |
 
-Resolve labels → ids via `ab sessions list`.
+Resolve names → ids via `ab sessions list`. Direct daemon HTTP paths always use the resolved id.
 
 ## Status format (universal — all agents follow this)
 
@@ -244,5 +237,5 @@ Don't message peers directly. Send a `QUESTION` to teamlead and let teamlead rou
 - **Your session cwd**: `<PROJECT_PATH>/_team/<PREFIX>-<ROLE>/` — this is your scratch / conversation home. Many CLI agents bind history and config to the cwd; this dir keeps your state isolated from the project tree and out of git (`_team/` is gitignored). Use it freely for notes, intermediate files, scratchpads.
 - When you need to operate on project files: use absolute paths from `<PROJECT_PATH>` or `cd <PROJECT_PATH>` for shell ops. Don't dump artefacts into your session cwd unless they're truly per-role and not part of the deliverable.
 - Each worker runs in **full-access / no-confirmation mode** — the orchestrator is the trust boundary. Don't fight your CLI's prompts; the launch flag should already have suppressed them.
-- Labels namespaced per project (`<PREFIX>-front` etc.).
+- Names are namespaced per project (`<PREFIX>-front` etc.).
 - Refer to `<PROJECT_PATH>/_src_data/` (or equivalent project-specified path) for canonical reference assets, never the editable copy in `src/`.
