@@ -5,7 +5,8 @@ package main
 //
 // Shape of the thing, and why it is this shape:
 //
-//   - ONE control connection, kept open, carrying nothing but keepalives and
+//   - ONE control connection PER CONFIGURED RELAY, kept open, carrying nothing
+//     but keepalives and
 //     "a client wants you" notifications;
 //   - ONE FRESH TCP CONNECTION PER STREAM. No multiplexing, no framing, no flow
 //     control. When the relay says OPEN, the daemon dials a new socket, says
@@ -128,9 +129,10 @@ func clampRelayKeepalive(seconds int) time.Duration {
 
 // --- persisted state -------------------------------------------------------
 
-// RelayConfig is the single row of relay_config, plus the fields the manager
-// writes back so `ab-pty relay status` can answer without the daemon.
+// RelayConfig is one named relay route, plus the fields the manager writes back
+// so `ab-pty relay status` can answer without the daemon.
 type RelayConfig struct {
+	Name        string `json:"name"`
 	Enabled     bool   `json:"enabled"`
 	Address     string `json:"address"`
 	Label       string `json:"label"`
@@ -138,15 +140,25 @@ type RelayConfig struct {
 	LastSuccess string `json:"last_success,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
 	State       string `json:"state"`
+	runID       uint64
 }
 
-// initRelayTable is called from initDB. The table is created in every mode so
-// that `ab-pty relay status` answers on an untouched install, exactly like
-// tls_clients.
+// initRelayTable is called from initDB. It also performs the one-way migration
+// from the original singleton relay_config table. The old row becomes the
+// named route "default", preserving the existing address, label, pin and
+// connection diagnostics.
 func initRelayTable() {
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS relay_config (
-			id           INTEGER PRIMARY KEY CHECK (id = 1),
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatal(err)
+	}
+	rollback := func(err error) {
+		_ = tx.Rollback()
+		log.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS relay_configs (
+			name         TEXT PRIMARY KEY,
 			enabled      INTEGER NOT NULL DEFAULT 0,
 			address      TEXT    NOT NULL DEFAULT '',
 			label        TEXT    NOT NULL DEFAULT '',
@@ -157,84 +169,264 @@ func initRelayTable() {
 			updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`); err != nil {
+		rollback(err)
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS relay_environment_state (
+			address      TEXT PRIMARY KEY,
+			last_success DATETIME,
+			last_error   TEXT NOT NULL DEFAULT '',
+			state        TEXT NOT NULL DEFAULT 'disconnected'
+		)
+	`); err != nil {
+		rollback(err)
+	}
+
+	var legacyExists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='relay_config'`).Scan(&legacyExists); err != nil {
+		rollback(err)
+	}
+
+	type storedAddress struct{ name, address, normalized string }
+	rows, err := tx.Query(`SELECT name, address FROM relay_configs ORDER BY name`)
+	if err != nil {
+		rollback(err)
+	}
+	var stored []storedAddress
+	needsCanonicalization := legacyExists != 0
+	for rows.Next() {
+		var item storedAddress
+		if err := rows.Scan(&item.name, &item.address); err != nil {
+			_ = rows.Close()
+			rollback(err)
+		}
+		item.normalized, err = normalizeRelayAddress(item.address)
+		if err != nil {
+			// Retain an invalid legacy value so status can explain it and the
+			// reconnect loop can report the dial error; new CLI writes cannot
+			// create one.
+			item.normalized = strings.TrimSpace(item.address)
+		}
+		if item.normalized != item.address {
+			needsCanonicalization = true
+		}
+		stored = append(stored, item)
+	}
+	if err := rows.Close(); err != nil {
+		rollback(err)
+	}
+	if needsCanonicalization {
+		// Drop/recreate only while actually canonicalising. Doing this on every
+		// CLI invocation needlessly takes a write lock from the running daemon.
+		if _, err := tx.Exec(`DROP INDEX IF EXISTS relay_configs_address_idx`); err != nil {
+			rollback(err)
+		}
+	}
+
+	if legacyExists != 0 {
+		var c RelayConfig
+		var enabled int
+		var lastSuccess sql.NullString
+		var updatedAt sql.NullString
+		err := tx.QueryRow(`SELECT enabled, address, label, pin, last_success, last_error, state, updated_at
+		                    FROM relay_config WHERE id = 1`).
+			Scan(&enabled, &c.Address, &c.Label, &c.Pin, &lastSuccess, &c.LastError, &c.State, &updatedAt)
+		if err != nil && err != sql.ErrNoRows {
+			rollback(err)
+		}
+		if err == nil {
+			if normalized, nerr := normalizeRelayAddress(c.Address); nerr == nil {
+				c.Address = normalized
+			} else {
+				c.Address = strings.TrimSpace(c.Address)
+			}
+			if _, err := tx.Exec(`
+				INSERT OR IGNORE INTO relay_configs
+					(name, enabled, address, label, pin, last_success, last_error, state, updated_at)
+				VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?)
+			`, enabled, c.Address, c.Label, c.Pin, lastSuccess, c.LastError, c.State, updatedAt); err != nil {
+				rollback(err)
+			}
+		}
+		if _, err := tx.Exec(`DROP TABLE relay_config`); err != nil {
+			rollback(err)
+		}
+	}
+	for _, item := range stored {
+		if item.normalized == item.address {
+			continue
+		}
+		if _, err := tx.Exec(`UPDATE relay_configs SET address = ? WHERE name = ?`, item.normalized, item.name); err != nil {
+			rollback(err)
+		}
+	}
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS relay_configs_address_idx ON relay_configs(address)`); err != nil {
+		rollback(fmt.Errorf("relay routes contain duplicate canonical addresses: %w", err))
+	}
+	if err := tx.Commit(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func loadRelayConfig() RelayConfig {
-	var c RelayConfig
+func loadRelayConfigs() []RelayConfig {
 	if db == nil {
-		return c
-	}
-	var enabled int
-	var lastSuccess sql.NullString
-	err := db.QueryRow(`SELECT enabled, address, label, pin, COALESCE(last_success,''), last_error, state
-	                    FROM relay_config WHERE id = 1`).
-		Scan(&enabled, &c.Address, &c.Label, &c.Pin, &lastSuccess, &c.LastError, &c.State)
-	// A missing row is the normal state of a fresh install, not a failure: fall
-	// through so the environment below still applies. Returning here is what
-	// made the documented env-only configuration silently do nothing until
-	// somebody ran `ab-pty relay connect`.
-	if err == nil {
-		c.Enabled = enabled != 0
-		c.LastSuccess = lastSuccess.String
-	} else if err != sql.ErrNoRows {
-		log.Printf("relay: reading relay_config: %v", err)
+		return nil
 	}
 
-	// The environment wins over the database so that a container or a unit
-	// file can pin the relay without anyone shelling in to run a command.
+	// The singular environment configuration retains its old declarative
+	// semantics: when present it replaces the stored routes. Multi-relay units
+	// should persist routes with `relay connect -name ...` instead.
 	if addr := strings.TrimSpace(os.Getenv(relayAddrEnv)); addr != "" {
-		c.Address = addr
-		c.Enabled = true
+		if normalized, err := normalizeRelayAddress(addr); err == nil {
+			addr = normalized
+		}
+		c := RelayConfig{
+			Name:    "environment",
+			Enabled: true,
+			Address: addr,
+			Label:   strings.TrimSpace(os.Getenv(relayLabelEnv)),
+			Pin:     strings.TrimSpace(os.Getenv(relayPinEnv)),
+			State:   "configured",
+		}
+		var lastSuccess sql.NullString
+		if err := db.QueryRow(`SELECT COALESCE(last_success,''), last_error, state
+		                       FROM relay_environment_state WHERE address = ?`, addr).
+			Scan(&lastSuccess, &c.LastError, &c.State); err == nil {
+			c.LastSuccess = lastSuccess.String
+		} else if err != sql.ErrNoRows {
+			log.Printf("relay: reading environment state: %v", err)
+		}
+		return []RelayConfig{c}
 	}
-	if l := strings.TrimSpace(os.Getenv(relayLabelEnv)); l != "" {
-		c.Label = l
+
+	rows, err := db.Query(`SELECT name, enabled, address, label, pin, COALESCE(last_success,''), last_error, state
+	                       FROM relay_configs ORDER BY name`)
+	if err != nil {
+		log.Printf("relay: reading relay_configs: %v", err)
+		return nil
 	}
-	if p := strings.TrimSpace(os.Getenv(relayPinEnv)); p != "" {
-		c.Pin = p
+	defer rows.Close()
+	var configs []RelayConfig
+	for rows.Next() {
+		var c RelayConfig
+		var enabled int
+		var lastSuccess sql.NullString
+		if err := rows.Scan(&c.Name, &enabled, &c.Address, &c.Label, &c.Pin, &lastSuccess, &c.LastError, &c.State); err != nil {
+			log.Printf("relay: reading relay_configs row: %v", err)
+			continue
+		}
+		c.Enabled = enabled != 0 && c.Address != ""
+		c.LastSuccess = lastSuccess.String
+		configs = append(configs, c)
 	}
-	if c.Address == "" {
-		c.Enabled = false
-	}
-	return c
+	return configs
 }
 
-func saveRelayConfig(enabled bool, address, label, pin string) error {
+func saveRelayConfig(c RelayConfig) error {
 	e := 0
-	if enabled {
+	if c.Enabled {
 		e = 1
 	}
 	_, err := db.Exec(`
-		INSERT INTO relay_config (id, enabled, address, label, pin, updated_at)
-		VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(id) DO UPDATE SET
+		INSERT INTO relay_configs (name, enabled, address, label, pin, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(name) DO UPDATE SET
 			enabled = excluded.enabled,
 			address = excluded.address,
 			label   = excluded.label,
 			pin     = excluded.pin,
 			updated_at = CURRENT_TIMESTAMP`,
-		e, address, label, pin)
+		c.Name, e, c.Address, c.Label, c.Pin)
 	return err
 }
 
-func setRelayState(state, lastErr string, success bool) {
+func renameRelayConfig(oldName, newName string) error {
+	_, err := db.Exec(`UPDATE relay_configs SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`, newName, oldName)
+	return err
+}
+
+// saveRelayConfigReplacing performs an operator-facing rename and its config
+// update as one transaction. The polling manager can therefore see either the
+// old complete route or the new complete route, never a half-renamed one.
+func saveRelayConfigReplacing(c RelayConfig, oldName string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if oldName != "" && oldName != c.Name {
+		if _, err := tx.Exec(`UPDATE relay_configs SET name = ? WHERE name = ?`, c.Name, oldName); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	e := 0
+	if c.Enabled {
+		e = 1
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO relay_configs (name, enabled, address, label, pin, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(name) DO UPDATE SET
+			enabled = excluded.enabled,
+			address = excluded.address,
+			label   = excluded.label,
+			pin     = excluded.pin,
+			updated_at = CURRENT_TIMESTAMP`,
+		c.Name, e, c.Address, c.Label, c.Pin); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func saveValidatedRelayConfig(c RelayConfig, oldName string) error {
+	if strings.TrimSpace(c.Pin) != "" {
+		normalized, err := normalizeFingerprint(c.Pin)
+		if err != nil {
+			return err
+		}
+		c.Pin = normalized
+	}
+	return saveRelayConfigReplacing(c, oldName)
+}
+
+func setRelayState(name, address, state, lastErr string, success bool) {
 	if db == nil {
 		return
 	}
-	if success {
-		_, _ = db.Exec(`UPDATE relay_config SET state = ?, last_error = ?, last_success = CURRENT_TIMESTAMP WHERE id = 1`, state, lastErr)
+	if name == "environment" {
+		if success {
+			_, _ = db.Exec(`
+				INSERT INTO relay_environment_state (address, state, last_error, last_success)
+				VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+				ON CONFLICT(address) DO UPDATE SET state=excluded.state, last_error=excluded.last_error,
+					last_success=CURRENT_TIMESTAMP`, address, state, lastErr)
+			return
+		}
+		_, _ = db.Exec(`
+			INSERT INTO relay_environment_state (address, state, last_error)
+			VALUES (?, ?, ?)
+			ON CONFLICT(address) DO UPDATE SET state=excluded.state, last_error=excluded.last_error`,
+			address, state, lastErr)
 		return
 	}
-	_, _ = db.Exec(`UPDATE relay_config SET state = ?, last_error = ? WHERE id = 1`, state, lastErr)
+	if success {
+		_, _ = db.Exec(`UPDATE relay_configs SET state = ?, last_error = ?, last_success = CURRENT_TIMESTAMP WHERE name = ?`, state, lastErr, name)
+		return
+	}
+	_, _ = db.Exec(`UPDATE relay_configs SET state = ?, last_error = ? WHERE name = ?`, state, lastErr, name)
 }
 
 // relayConfiguredEnabled reports whether the persisted configuration (or the
 // environment) asks for the relay. Read after initDB, because the answer lives
 // in SQLite.
 func relayConfiguredEnabled() bool {
-	c := loadRelayConfig()
-	return c.Enabled && c.Address != ""
+	for _, c := range loadRelayConfigs() {
+		if c.Enabled && c.Address != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // --- backoff ---------------------------------------------------------------
@@ -262,15 +454,19 @@ func relayBackoff(attempt int, rnd float64) time.Duration {
 
 // --- manager ---------------------------------------------------------------
 
-// relayManager keeps at most one control session alive and follows changes to
-// the persisted configuration, so `ab-pty relay connect` and
-// `ab-pty relay disconnect` take effect without restarting the daemon.
+// relayManager keeps one independent control session alive for every enabled
+// relay route. Adding, changing or disabling one route does not disturb any of
+// the others.
 type relayManager struct {
 	ln *relayListener
 
-	mu     sync.Mutex
-	cur    RelayConfig
-	cancel chan struct{}
+	mu      sync.Mutex
+	runs    map[string]*relayRun
+	nextRun uint64
+	stop    chan struct{}
+	done    chan struct{}
+	stopOne sync.Once
+	wg      sync.WaitGroup
 
 	// inFlight counts streams opened on the relay's orders and not yet
 	// finished. It lives on the manager rather than on one control session
@@ -283,6 +479,11 @@ type relayManager struct {
 	// clamping. Exported through this field only so tests can see what the
 	// daemon actually accepted.
 	keepAliveNs atomic.Int64
+}
+
+type relayRun struct {
+	cfg    RelayConfig
+	cancel chan struct{}
 }
 
 // acquireStream takes one of the stream slots, or reports that they are all
@@ -311,35 +512,99 @@ func (m *relayManager) keepalive() time.Duration { return time.Duration(m.keepAl
 var relayMgr *relayManager
 
 func startRelayManager(ln *relayListener) {
-	m := &relayManager{ln: ln}
+	m := &relayManager{
+		ln:   ln,
+		runs: make(map[string]*relayRun),
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
 	relayMgr = m
-	go m.loop()
+	go func() {
+		m.loop(m.stop)
+		m.wg.Wait()
+		close(m.done)
+	}()
 }
 
-func (m *relayManager) loop() {
+func stopRelayManager() {
+	if relayMgr == nil || relayMgr.stop == nil {
+		return
+	}
+	relayMgr.stopOne.Do(func() { close(relayMgr.stop) })
+	<-relayMgr.done
+}
+
+func sameRelayConfig(a, b RelayConfig) bool {
+	return a.Name == b.Name && a.Enabled == b.Enabled && a.Address == b.Address &&
+		a.Label == b.Label && a.Pin == b.Pin
+}
+
+func (m *relayManager) loop(stop <-chan struct{}) {
 	for {
-		cfg := loadRelayConfig()
-		m.mu.Lock()
-		changed := cfg.Address != m.cur.Address || cfg.Enabled != m.cur.Enabled ||
-			cfg.Label != m.cur.Label || cfg.Pin != m.cur.Pin
-		if changed {
-			if m.cancel != nil {
-				close(m.cancel)
-				m.cancel = nil
-			}
-			m.cur = cfg
+		configs := loadRelayConfigs()
+		desired := make(map[string]RelayConfig, len(configs))
+		for _, cfg := range configs {
 			if cfg.Enabled && cfg.Address != "" {
-				stop := make(chan struct{})
-				m.cancel = stop
-				go m.session(cfg, stop)
-			} else {
-				setRelayState("disconnected", "", false)
-				log.Printf("relay: disabled")
+				desired[cfg.Name] = cfg
 			}
 		}
+
+		m.mu.Lock()
+		if m.runs == nil {
+			m.runs = make(map[string]*relayRun)
+		}
+		for name, run := range m.runs {
+			cfg, exists := desired[name]
+			if !exists || !sameRelayConfig(cfg, run.cfg) {
+				close(run.cancel)
+				delete(m.runs, name)
+			}
+		}
+		for name, cfg := range desired {
+			if _, exists := m.runs[name]; exists {
+				continue
+			}
+			cancel := make(chan struct{})
+			m.nextRun++
+			cfg.runID = m.nextRun
+			m.runs[name] = &relayRun{cfg: cfg, cancel: cancel}
+			m.wg.Add(1)
+			go func(cfg RelayConfig, cancel chan struct{}) {
+				defer m.wg.Done()
+				m.session(cfg, cancel)
+			}(cfg, cancel)
+		}
 		m.mu.Unlock()
-		time.Sleep(relayConfigPoll)
+
+		select {
+		case <-stop:
+			m.mu.Lock()
+			for name, run := range m.runs {
+				close(run.cancel)
+				setRelayState(run.cfg.Name, run.cfg.Address, "disconnected", "", false)
+				delete(m.runs, name)
+			}
+			m.mu.Unlock()
+			return
+		case <-time.After(relayConfigPoll):
+		}
 	}
+}
+
+// setState ignores a write from a canceled generation. Without this guard, a
+// slow old connection can report "disconnected" after its replacement has
+// already reported "connected" for the same named route.
+func (m *relayManager) setState(cfg RelayConfig, state, lastErr string, success bool) {
+	if cfg.runID != 0 {
+		m.mu.Lock()
+		run := m.runs[cfg.Name]
+		current := run != nil && run.cfg.runID == cfg.runID
+		m.mu.Unlock()
+		if !current {
+			return
+		}
+	}
+	setRelayState(cfg.Name, cfg.Address, state, lastErr, success)
 }
 
 // session is the reconnect loop for one configuration.
@@ -360,16 +625,16 @@ func (m *relayManager) session(cfg RelayConfig, stop <-chan struct{}) {
 		default:
 		}
 		if err != nil {
-			setRelayState("reconnecting", err.Error(), false)
-			log.Printf("relay: %v", err)
+			m.setState(cfg, "reconnecting", err.Error(), false)
+			log.Printf("relay %q: %v", cfg.Name, err)
 		} else {
-			setRelayState("reconnecting", "control connection closed", false)
-			log.Printf("relay: control connection to %s closed", cfg.Address)
+			m.setState(cfg, "reconnecting", "control connection closed", false)
+			log.Printf("relay %q: control connection to %s closed", cfg.Name, cfg.Address)
 			attempt = 0 // a session that actually worked starts over
 		}
 		d := relayBackoff(attempt, rnd.Float64())
 		attempt++
-		log.Printf("relay: reconnecting to %s in %s", cfg.Address, d.Truncate(10*time.Millisecond))
+		log.Printf("relay %q: reconnecting to %s in %s", cfg.Name, cfg.Address, d.Truncate(10*time.Millisecond))
 		select {
 		case <-stop:
 			return
@@ -460,9 +725,9 @@ func (m *relayManager) connectOnce(cfg RelayConfig, stop <-chan struct{}) error 
 	}
 	_ = conn.SetDeadline(time.Time{})
 	m.keepAliveNs.Store(int64(keepalive))
-	setRelayState("connected", "", true)
-	log.Printf("relay: connected to %s as %q (keepalive %s)", cfg.Address, name, keepalive)
-	defer setRelayState("disconnected", "", false)
+	m.setState(cfg, "connected", "", true)
+	log.Printf("relay %q: connected to %s as %q (keepalive %s)", cfg.Name, cfg.Address, name, keepalive)
+	defer m.setState(cfg, "disconnected", "", false)
 
 	// A dead control channel is indistinguishable from an idle one until
 	// something is written, and NAT boxes forget mappings in minutes. The
@@ -636,21 +901,22 @@ func sanitizeToken(s string) string {
 
 const relayUsage = `ab-pty relay — reach this daemon through a relay, from anywhere
 
-  ab-pty relay connect <host:port> [-label NAME] [-pin SHA256]
-        Dial out to a relay and stay connected. Takes effect immediately: a
-        running daemon picks the change up within a few seconds, and a stopped
-        one starts connected. The relay must already know this daemon's
-        certificate fingerprint:
+  ab-pty relay connect <host:port> [-name ROUTE] [-label NAME] [-pin SHA256]
+        Add or update a relay route and stay connected to it. Repeat with
+        different route names (for example "home" and "remote") to keep this
+        same daemon online on several relays concurrently. The relay must
+        already know this daemon's certificate fingerprint:
 
             ab-pty tls fingerprint          # on this machine
             ab-relay agent add <name> <fp>  # on the relay
 
-  ab-pty relay status
-        Show the configured relay, this daemon's identifier and the last
-        success / last error recorded by the connection loop.
+  ab-pty relay status [ROUTE]
+        Show every configured relay route (or one named route), this daemon's
+        identifier and each connection loop's last success / last error.
 
-  ab-pty relay disconnect
-        Stop using the relay. The LAN listener is unaffected.
+  ab-pty relay disconnect [ROUTE|host:port|--all]
+        Disable one route. With no argument (or --all), disable every route.
+        The LAN listener is unaffected.
 
   ab-pty relay id
         Print this daemon's relay identifier: the SHA-256 of its server
@@ -679,15 +945,9 @@ func runRelay(args []string) {
 	case "connect":
 		runRelayConnect(args[1:])
 	case "status":
-		runRelayStatus()
+		runRelayStatus(args[1:])
 	case "disconnect":
-		cur := loadRelayConfig()
-		if err := saveRelayConfig(false, cur.Address, cur.Label, cur.Pin); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		setRelayState("disconnected", "", false)
-		fmt.Println("Relay disabled. A running daemon drops the connection within a few seconds.")
+		runRelayDisconnect(args[1:])
 	case "id":
 		fp, err := serverCertFingerprintFromDisk()
 		if err != nil {
@@ -702,78 +962,226 @@ func runRelay(args []string) {
 	}
 }
 
+func normalizeRelayAddress(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil || host == "" || port == "" {
+		return "", fmt.Errorf("%q is not host:port", addr)
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+func validateRelayName(name string) error {
+	if name == "" {
+		return fmt.Errorf("relay route name cannot be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("relay route name is longer than 64 bytes")
+	}
+	if strings.ContainsAny(name, "\r\n\t") {
+		return fmt.Errorf("relay route name cannot contain control characters")
+	}
+	return nil
+}
+
+func relaySelectorMatches(c RelayConfig, selector string) bool {
+	if c.Name == selector || c.Address == selector {
+		return true
+	}
+	normalized, err := normalizeRelayAddress(selector)
+	return err == nil && c.Address == normalized
+}
+
 func runRelayConnect(args []string) {
-	label, pin := "", ""
+	label, pin, routeName := "", "", ""
+	explicitRouteName := false
 	var addr string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "-name", "--name":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: -name requires a value")
+				os.Exit(2)
+			}
+			i++
+			routeName = strings.TrimSpace(args[i])
+			explicitRouteName = true
 		case "-label", "--label":
-			if i+1 < len(args) {
-				i++
-				label = args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: -label requires a value")
+				os.Exit(2)
 			}
+			i++
+			label = args[i]
 		case "-pin", "--pin":
-			if i+1 < len(args) {
-				i++
-				pin = args[i]
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: -pin requires a value")
+				os.Exit(2)
 			}
+			i++
+			pin = args[i]
 		default:
 			if addr == "" {
 				addr = args[i]
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: unexpected argument %q\n", args[i])
+				os.Exit(2)
 			}
 		}
 	}
 	if addr == "" {
-		fmt.Fprintln(os.Stderr, "usage: ab-pty relay connect <host:port> [-label NAME] [-pin SHA256]")
+		fmt.Fprintln(os.Stderr, "usage: ab-pty relay connect <host:port> [-name ROUTE] [-label NAME] [-pin SHA256]")
 		os.Exit(2)
 	}
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %q is not host:port\n", addr)
+	var err error
+	addr, err = normalizeRelayAddress(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
 	}
-	if pin != "" {
-		norm, err := normalizeFingerprint(pin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	configs := loadRelayConfigs()
+	if strings.TrimSpace(os.Getenv(relayAddrEnv)) != "" {
+		fmt.Fprintf(os.Stderr, "Error: %s is set; stored relay routes are suppressed by the environment configuration\n", relayAddrEnv)
+		os.Exit(1)
+	}
+	if routeName == "" {
+		for _, c := range configs {
+			if c.Address == addr {
+				routeName = c.Name
+				break
+			}
+		}
+		if routeName == "" {
+			routeName = addr
+		}
+	}
+	if err := validateRelayName(routeName); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	renameFrom := ""
+	for _, c := range configs {
+		if c.Address != addr || c.Name == routeName {
+			continue
+		}
+		if !explicitRouteName {
+			fmt.Fprintf(os.Stderr, "Error: relay address %s is already configured as route %q\n", addr, c.Name)
 			os.Exit(1)
 		}
-		pin = norm
+		for _, other := range configs {
+			if other.Name == routeName {
+				fmt.Fprintf(os.Stderr, "Error: relay route %q already points to %s\n", routeName, other.Address)
+				os.Exit(1)
+			}
+		}
+		renameFrom = c.Name
 	}
-	if err := saveRelayConfig(true, addr, label, pin); err != nil {
+	if err := saveValidatedRelayConfig(
+		RelayConfig{Name: routeName, Enabled: true, Address: addr, Label: label, Pin: pin}, renameFrom); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	fp, ferr := serverCertFingerprintFromDisk()
-	fmt.Printf("Relay set to %s\n", addr)
+	fmt.Printf("Relay route %q set to %s\n", routeName, addr)
 	if ferr == nil {
 		fmt.Printf("This daemon's relay id: %s\n", fp)
 		fmt.Printf("Register it on the relay: ab-relay agent add <name> %s\n", fp)
 	} else {
 		fmt.Printf("WARNING: no server certificate yet (%v) — run `ab-pty tls init`\n", ferr)
 	}
-	if !relayEnabled() {
-		fmt.Printf("Start the daemon with %s=1 for the relay listener to exist.\n", relayEnabledEnv)
-	}
 }
 
-func runRelayStatus() {
-	c := loadRelayConfig()
-	fp, ferr := serverCertFingerprintFromDisk()
-	fmt.Printf("enabled:      %v\n", c.Enabled)
-	fmt.Printf("address:      %s\n", orDash(c.Address))
-	fmt.Printf("label:        %s\n", orDash(c.Label))
-	if c.Pin != "" {
-		fmt.Printf("relay pin:    %s\n", prettyFingerprint(c.Pin))
+func runRelayStatus(args []string) {
+	if len(args) > 1 {
+		fmt.Fprintln(os.Stderr, "usage: ab-pty relay status [ROUTE]")
+		os.Exit(2)
 	}
-	fmt.Printf("state:        %s\n", orDash(c.State))
-	fmt.Printf("last success: %s\n", orDash(c.LastSuccess))
-	fmt.Printf("last error:   %s\n", orDash(c.LastError))
+	configs := loadRelayConfigs()
+	if len(args) == 1 {
+		selected := configs[:0]
+		for _, c := range configs {
+			if relaySelectorMatches(c, args[0]) {
+				selected = append(selected, c)
+			}
+		}
+		configs = selected
+		if len(configs) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: relay route %q not found\n", args[0])
+			os.Exit(1)
+		}
+	}
+	fp, ferr := serverCertFingerprintFromDisk()
+	enabled := false
+	for _, c := range configs {
+		enabled = enabled || c.Enabled
+	}
+	// Keep the first line parseable for scripts written for the singleton
+	// status output. It now means "at least one route is enabled".
+	fmt.Printf("enabled:      %v\n", enabled)
+	for i, c := range configs {
+		if i > 0 {
+			fmt.Println()
+		}
+		fmt.Printf("route:        %s\n", c.Name)
+		fmt.Printf("  enabled:      %v\n", c.Enabled)
+		fmt.Printf("  address:      %s\n", orDash(c.Address))
+		fmt.Printf("  label:        %s\n", orDash(c.Label))
+		if c.Pin != "" {
+			fmt.Printf("  relay pin:    %s\n", prettyFingerprint(c.Pin))
+		}
+		fmt.Printf("  state:        %s\n", orDash(c.State))
+		fmt.Printf("  last success: %s\n", orDash(c.LastSuccess))
+		fmt.Printf("  last error:   %s\n", orDash(c.LastError))
+	}
 	if ferr == nil {
 		fmt.Printf("relay id:     %s\n", fp)
 	} else {
 		fmt.Printf("relay id:     unavailable (%v)\n", ferr)
 	}
-	fmt.Printf("listener:     %s=%v\n", relayEnabledEnv, relayEnabled())
+	fmt.Printf("listener:     configured=%v (%s=%v)\n", relayConfiguredEnabled(), relayEnabledEnv, relayEnabled())
+}
+
+func runRelayDisconnect(args []string) {
+	if len(args) > 1 {
+		fmt.Fprintln(os.Stderr, "usage: ab-pty relay disconnect [ROUTE|host:port|--all]")
+		os.Exit(2)
+	}
+	if strings.TrimSpace(os.Getenv(relayAddrEnv)) != "" {
+		fmt.Fprintf(os.Stderr, "Error: relay is configured by %s; remove it from the environment to disconnect\n", relayAddrEnv)
+		os.Exit(1)
+	}
+	selector := "--all"
+	if len(args) == 1 {
+		selector = args[0]
+	}
+	configs := loadRelayConfigs()
+	changed := 0
+	for _, c := range configs {
+		if selector != "--all" && !relaySelectorMatches(c, selector) {
+			continue
+		}
+		if c.Enabled {
+			c.Enabled = false
+			if err := saveRelayConfig(c); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		setRelayState(c.Name, c.Address, "disconnected", "", false)
+		changed++
+	}
+	if changed == 0 && selector != "--all" {
+		fmt.Fprintf(os.Stderr, "Error: relay route %q not found\n", selector)
+		os.Exit(1)
+	}
+	if selector == "--all" {
+		fmt.Printf("Disabled %d relay route(s). A running daemon drops the connections within a few seconds.\n", changed)
+	} else {
+		fmt.Printf("Relay route %q disabled. A running daemon drops the connection within a few seconds.\n", selector)
+	}
 }
 
 func orDash(s string) string {

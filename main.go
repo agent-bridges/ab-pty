@@ -1857,6 +1857,9 @@ Setup:
 		if err := srv.Shutdown(ctx); err != nil {
 			log.Printf("graceful shutdown timed out: %v", err)
 		}
+		// Relay sessions write their per-route connection state to SQLite.
+		// Stop and join every reconnect loop before closing that database.
+		stopRelayManager()
 		closePtySubscribers()
 		if db != nil {
 			if err := db.Close(); err != nil {

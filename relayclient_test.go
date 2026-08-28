@@ -283,6 +283,21 @@ func (r *fakeRelay) connectCount() int {
 	return r.connects
 }
 
+func (r *fakeRelay) dropControl() {
+	r.mu.Lock()
+	c := r.ctl
+	r.mu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
+}
+
+func (r *fakeRelay) fingerprint() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.agentFP
+}
+
 type replayConn struct {
 	net.Conn
 	r io.Reader
@@ -353,7 +368,7 @@ func newRelayClientStand(t *testing.T, opts ...func(*fakeRelay)) *relayClientSta
 
 	m := &relayManager{ln: ln}
 	stop := make(chan struct{})
-	go m.session(RelayConfig{Enabled: true, Address: relay.addr, Label: "test"}, stop)
+	go m.session(RelayConfig{Name: "test", Enabled: true, Address: relay.addr, Label: "test"}, stop)
 	t.Cleanup(func() {
 		close(stop)
 		ln.Close()
@@ -593,39 +608,233 @@ func TestRelayBackoff(t *testing.T) {
 func TestRelayConfigRoundTrip(t *testing.T) {
 	initTestDB()
 	initRelayTable()
-	if _, err := db.Exec(`DELETE FROM relay_config`); err != nil {
+	if _, err := db.Exec(`DELETE FROM relay_configs`); err != nil {
 		t.Fatal(err)
 	}
 	if relayConfiguredEnabled() {
 		t.Fatal("a fresh install has the relay on")
 	}
-	if err := saveRelayConfig(true, "relay.example:9500", "homebox", ""); err != nil {
+	if err := saveRelayConfig(RelayConfig{Name: "home", Enabled: true, Address: "relay.example:9500", Label: "homebox"}); err != nil {
 		t.Fatal(err)
 	}
-	c := loadRelayConfig()
-	if !c.Enabled || c.Address != "relay.example:9500" || c.Label != "homebox" {
-		t.Fatalf("round trip: %+v", c)
+	if err := saveRelayConfig(RelayConfig{Name: "remote", Enabled: true, Address: "remote.example:9500", Label: "homebox"}); err != nil {
+		t.Fatal(err)
+	}
+	configs := loadRelayConfigs()
+	if len(configs) != 2 || configs[0].Name != "home" || !configs[0].Enabled ||
+		configs[0].Address != "relay.example:9500" || configs[0].Label != "homebox" ||
+		configs[1].Name != "remote" {
+		t.Fatalf("round trip: %+v", configs)
 	}
 	if !relayConfiguredEnabled() {
 		t.Fatal("relayConfiguredEnabled disagrees with the stored row")
 	}
 
-	setRelayState("connected", "", true)
-	if c := loadRelayConfig(); c.State != "connected" || c.LastSuccess == "" {
-		t.Fatalf("state not recorded: %+v", c)
+	setRelayState("home", "relay.example:9500", "connected", "", true)
+	configs = loadRelayConfigs()
+	if configs[0].State != "connected" || configs[0].LastSuccess == "" {
+		t.Fatalf("state not recorded: %+v", configs[0])
 	}
 
-	if err := saveRelayConfig(false, c.Address, c.Label, ""); err != nil {
-		t.Fatal(err)
+	for _, c := range configs {
+		c.Enabled = false
+		if err := saveRelayConfig(c); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if relayConfiguredEnabled() {
 		t.Fatal("disconnect did not stick")
 	}
 
-	// The environment overrides the row, for containers and unit files.
-	t.Setenv(relayAddrEnv, "env.example:9999")
-	if c := loadRelayConfig(); !c.Enabled || c.Address != "env.example:9999" {
-		t.Fatalf("environment override ignored: %+v", c)
+	// The environment suppresses all stored routes, for containers and unit
+	// files, and keeps diagnostics for that address separately.
+	t.Setenv(relayAddrEnv, "ENV.EXAMPLE:9999")
+	setRelayState("environment", "env.example:9999", "connected", "", true)
+	configs = loadRelayConfigs()
+	if len(configs) != 1 || !configs[0].Enabled || configs[0].Name != "environment" ||
+		configs[0].Address != "env.example:9999" || configs[0].State != "connected" || configs[0].LastSuccess == "" {
+		t.Fatalf("environment override ignored: %+v", configs)
+	}
+}
+
+func TestRelayConfigMigratesSingletonIdempotently(t *testing.T) {
+	initTestDB()
+	if _, err := db.Exec(`DROP TABLE IF EXISTS relay_configs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS relay_environment_state`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS relay_config`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE relay_config (
+			id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL,
+			address TEXT NOT NULL, label TEXT NOT NULL, pin TEXT NOT NULL,
+			last_success DATETIME, last_error TEXT NOT NULL, state TEXT NOT NULL,
+			updated_at DATETIME
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO relay_config VALUES
+		(1, 1, 'OLD.Example.:9500', 'ab2', 'abc', '2026-01-02 03:04:05', '', 'connected', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+
+	initRelayTable()
+	initRelayTable() // a restart must neither duplicate nor erase the route
+	configs := loadRelayConfigs()
+	if len(configs) != 1 || configs[0].Name != "default" || configs[0].Address != "old.example:9500" ||
+		configs[0].Label != "ab2" || configs[0].Pin != "abc" || configs[0].State != "connected" {
+		t.Fatalf("legacy relay was not preserved: %+v", configs)
+	}
+	var oldTable int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='relay_config'`).Scan(&oldTable); err != nil {
+		t.Fatal(err)
+	}
+	if oldTable != 0 {
+		t.Fatal("legacy singleton table still exists after migration")
+	}
+	if err := renameRelayConfig("default", "Remote"); err != nil {
+		t.Fatal(err)
+	}
+	configs = loadRelayConfigs()
+	if len(configs) != 1 || configs[0].Name != "Remote" || configs[0].Address != "old.example:9500" {
+		t.Fatalf("migrated route cannot be given its operator-facing name: %+v", configs)
+	}
+	if err := saveValidatedRelayConfig(RelayConfig{
+		Name: "Renamed", Enabled: true, Address: "old.example:9500", Pin: "not-a-fingerprint",
+	}, "Remote"); err == nil {
+		t.Fatal("invalid relay pin was accepted")
+	}
+	configs = loadRelayConfigs()
+	if len(configs) != 1 || configs[0].Name != "Remote" {
+		t.Fatalf("invalid pin permanently renamed the route: %+v", configs)
+	}
+	if !relaySelectorMatches(configs[0], "OLD.EXAMPLE.:9500") {
+		t.Fatal("host:port selector does not use canonical address matching")
+	}
+}
+
+func TestRelayManagerKeepsTwoRelaysOnlineIndependently(t *testing.T) {
+	initTestDB()
+	initTLSClientsTable()
+	initRelayTable()
+	if _, err := db.Exec(`DELETE FROM relay_configs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM tls_clients`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	crt := filepath.Join(dir, "server.crt")
+	key := filepath.Join(dir, "server.key")
+	if err := generateSelfSignedCert(crt, key, []string{"localhost"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tlsCertEnv, crt)
+	t.Setenv(tlsKeyEnv, key)
+	t.Setenv(tlsModeEnv, "off")
+
+	srv := &http.Server{Handler: buildMux()}
+	ln, err := serveRelay(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := newFakeRelay(t)
+	remote := newFakeRelay(t)
+	if err := saveRelayConfig(RelayConfig{Name: "home", Enabled: true, Address: home.addr, Label: "ab2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRelayConfig(RelayConfig{Name: "remote", Enabled: true, Address: remote.addr, Label: "ab2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &relayManager{ln: ln, runs: make(map[string]*relayRun)}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		m.loop(stop)
+		m.wg.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		<-done
+		_ = ln.Close()
+		_ = srv.Close()
+	})
+
+	if !home.waitAgent(10*time.Second) || !remote.waitAgent(10*time.Second) {
+		t.Fatal("the same daemon did not connect to both relay routes")
+	}
+	wantFP, err := serverCertFingerprintFromDisk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if home.fingerprint() != wantFP || remote.fingerprint() != wantFP {
+		t.Fatalf("relay identities differ: home=%s remote=%s daemon=%s",
+			home.fingerprint(), remote.fingerprint(), wantFP)
+	}
+	cert, clientFP := newClientCert(t)
+	if err := addAuthorizedClient("test-phone", clientFP); err != nil {
+		t.Fatal(err)
+	}
+	checkHealth := func(route string, relay *fakeRelay) {
+		t.Helper()
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				DialContext: dialViaRelay(relay),
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					Certificates:       []tls.Certificate{cert},
+				},
+			},
+		}
+		defer client.CloseIdleConnections()
+		resp, err := client.Get("https://relay/health")
+		if err != nil {
+			t.Fatalf("GET /health through %s: %v", route, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /health through %s: status %s", route, resp.Status)
+		}
+	}
+	checkHealth("home", home)
+	checkHealth("remote", remote)
+
+	// Losing Home must restart only Home's control loop. Remote remains on its
+	// original control connection and keeps serving the same PTY daemon while
+	// Home is actually offline.
+	home.stop()
+	checkHealth("remote while home is offline", remote)
+	home.listenAgain()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && home.connectCount() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if home.connectCount() < 2 {
+		t.Fatal("home relay did not reconnect independently")
+	}
+	if got := remote.connectCount(); got != 1 {
+		t.Fatalf("remote relay was needlessly restarted %d time(s)", got-1)
+	}
+
+	var configs []RelayConfig
+	stateDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(stateDeadline) {
+		configs = loadRelayConfigs()
+		if len(configs) == 2 && configs[0].State == "connected" && configs[1].State == "connected" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(configs) != 2 || configs[0].State != "connected" || configs[1].State != "connected" {
+		t.Fatalf("per-route state not preserved: %+v", configs)
 	}
 }
 
