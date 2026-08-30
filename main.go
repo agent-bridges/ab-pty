@@ -37,7 +37,6 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/fsnotify/fsnotify"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sys/unix"
@@ -303,52 +302,7 @@ func collectChildren(pid int, result *[]ProcessInfo, depth int) {
 // Version injected at build time via: go build -ldflags "-X main.Version=1.2.3"
 var Version = "dev"
 
-// JWT authentication
-//
-// Canonical location: /opt/ab/.jwt-secret
-// Legacy locations (still read, with warning — remove after migration):
-//
-//	/opt/agent-bridge/.jwt-secret  (v0.1.9+)
-//	/opt/nag-daemons/.jwt-secret   (pre-v0.1.9)
-//
-// AB_PTY_JWT_SECRET_PATH (see jwtSecretPathEnv below) overrides all of the
-// above: when set, the secret is read only from that exact path, with no
-// canonical/legacy fallback. This is for installs that have no /opt access
-// at all (e.g. a non-canonical dev stand under $HOME) rather than for a
-// deployment migrating off a legacy path — those should keep using the
-// canonical /opt/ab layout.
-const jwtSecretFileCanonical = "/opt/ab/.jwt-secret"
-
-var jwtSecretFileLegacy = []string{
-	"/opt/agent-bridge/.jwt-secret",
-	"/opt/nag-daemons/.jwt-secret",
-}
-
-// Reported as the canonical path in logs/errors — kept as a var for tests.
-var jwtSecretFile = jwtSecretFileCanonical
-
 const allowedOriginsEnv = "AB_PTY_ALLOWED_ORIGINS"
-const jwtSecretPathEnv = "AB_PTY_JWT_SECRET_PATH"
-
-// jwtSecretSearchPaths returns the ordered list of paths to try when loading
-// the JWT secret. Shared by jwtSecretCache.get() (daemon) and getLocalJWT()
-// (CLI helper) so the AB_PTY_JWT_SECRET_PATH override behaves identically
-// in both places.
-func jwtSecretSearchPaths() []string {
-	if envPath := strings.TrimSpace(os.Getenv(jwtSecretPathEnv)); envPath != "" {
-		return []string{envPath}
-	}
-	return append([]string{jwtSecretFileCanonical}, jwtSecretFileLegacy...)
-}
-
-type jwtSecretCache struct {
-	mu       sync.RWMutex
-	secret   string
-	lastLoad time.Time
-	ttl      time.Duration
-}
-
-var jwtCache = &jwtSecretCache{ttl: 5 * time.Second}
 
 func isAllowedWebSocketOrigin(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
@@ -380,99 +334,22 @@ func isAllowedWebSocketOrigin(r *http.Request) bool {
 	return false
 }
 
-func (c *jwtSecretCache) get() string {
-	c.mu.RLock()
-	if time.Since(c.lastLoad) < c.ttl && c.secret != "" {
-		defer c.mu.RUnlock()
-		return c.secret
-	}
-	c.mu.RUnlock()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if time.Since(c.lastLoad) < c.ttl && c.secret != "" {
-		return c.secret
-	}
-
-	// AB_PTY_JWT_SECRET_PATH pins the secret to one explicit path — no
-	// canonical/legacy fallback — for non-canonical installs (no /opt
-	// access). Otherwise: canonical path first, then each legacy path with
-	// a deprecation warning.
-	envPath := strings.TrimSpace(os.Getenv(jwtSecretPathEnv))
-	paths := jwtSecretSearchPaths()
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		secret := strings.TrimSpace(string(data))
-		if len(secret) < 32 {
-			continue
-		}
-		c.secret = secret
-		c.lastLoad = time.Now()
-		switch {
-		case envPath != "":
-			log.Printf("JWT secret loaded from %s (%s)", p, jwtSecretPathEnv)
-		case p == jwtSecretFileCanonical:
-			log.Printf("JWT secret loaded from %s", p)
-		default:
-			log.Printf("WARN: JWT secret loaded from legacy path %s — migrate to %s", p, jwtSecretFileCanonical)
-		}
-		return c.secret
-	}
-	return c.secret
-}
-
-func jwtMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		secret := jwtCache.get()
-		if secret == "" {
-			http.Error(w, "jwt secret is not configured", http.StatusServiceUnavailable)
-			return
-		}
-
-		// Require bearer token from Authorization header.
-		authHeader := r.Header.Get("Authorization")
-
-		if authHeader == "" {
-			http.Error(w, "missing authorization", http.StatusUnauthorized)
-			return
-		}
-
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			http.Error(w, "invalid authorization format", http.StatusUnauthorized)
-			return
-		}
-
-		token, err := jwt.Parse(parts[1], func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return []byte(secret), nil
-		})
-
-		if err != nil || !token.Valid {
-			http.Error(w, "invalid token", http.StatusUnauthorized)
-			return
-		}
-
-		next(w, r)
-	}
-}
-
 // deriveSessionToken mints the in-session bearer token for a given sessionID.
-// Format: "sess.<session_id>.<hex(HMAC_SHA256(jwtSecret, "session:"+session_id))>"
+// Format: "sess.<session_id>.<hex(HMAC_SHA256(processSecret, "session:"+session_id))>"
 // The token is injected into the PTY's env as AB_PTY_SESSION_TOKEN so the agent
-// running inside the session can call /api/pty/* endpoints on 127.0.0.1.
-func deriveSessionToken(sessionID string) string {
-	secret := jwtCache.get()
-	if secret == "" {
-		return ""
+// running inside the session can call daemon endpoints on loopback. The secret
+// is generated in memory at process start and is never persisted or shared with
+// external clients; daemon restart invalidates every old token.
+var sessionAuthSecret = func() [32]byte {
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		panic(fmt.Sprintf("generate in-session auth secret: %v", err))
 	}
-	mac := hmac.New(sha256.New, []byte(secret))
+	return secret
+}()
+
+func deriveSessionToken(sessionID string) string {
+	mac := hmac.New(sha256.New, sessionAuthSecret[:])
 	mac.Write([]byte("session:" + sessionID))
 	return "sess." + sessionID + "." + hex.EncodeToString(mac.Sum(nil))
 }
@@ -493,11 +370,7 @@ func validateSessionToken(token string) (string, bool) {
 	sessionID := rest[:idx]
 	presented := rest[idx+1:]
 
-	secret := jwtCache.get()
-	if secret == "" {
-		return "", false
-	}
-	mac := hmac.New(sha256.New, []byte(secret))
+	mac := hmac.New(sha256.New, sessionAuthSecret[:])
 	mac.Write([]byte("session:" + sessionID))
 	expected := hex.EncodeToString(mac.Sum(nil))
 	if subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) != 1 {
@@ -513,15 +386,11 @@ func validateSessionToken(token string) (string, bool) {
 	return sessionID, true
 }
 
-// sessionTokenOrJwt accepts either the existing daemon JWT or an in-session
-// bearer token minted by deriveSessionToken. Session-token holders get the
-// same privileges as JWT holders in v1 — this matches the "the agent inside
-// a PTY can do what the AB UI user can do" spec.
 // requireLoopback rejects requests that did not originate on this host.
 //
 // Used for /api/hook, which Claude Code's hook runner POSTs to from inside
-// a PTY we spawned. Those hooks have no JWT and no session token, so the
-// endpoint cannot use sessionTokenOrJwt — but the daemon binds 0.0.0.0
+// a PTY we spawned. Those hooks have no session credential, but the daemon
+// binds 0.0.0.0
 // (the AB back reaches it over the LAN or via the :8422 TLS proxy), which
 // left the handler callable by anyone who could route to port 8421. The
 // handler writes the claude_session_id→pty_id mapping that later hook
@@ -549,175 +418,6 @@ func requireLoopback(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
-}
-
-func sessionTokenOrJwt(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		secret := jwtCache.get()
-		if secret == "" {
-			http.Error(w, "jwt secret is not configured", http.StatusServiceUnavailable)
-			return
-		}
-
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, "missing authorization", http.StatusUnauthorized)
-			return
-		}
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			http.Error(w, "invalid authorization format", http.StatusUnauthorized)
-			return
-		}
-		presented := parts[1]
-
-		// Session-token path
-		if strings.HasPrefix(presented, "sess.") {
-			if _, ok := validateSessionToken(presented); ok {
-				next(w, r)
-				return
-			}
-			http.Error(w, "invalid or expired session token", http.StatusUnauthorized)
-			return
-		}
-
-		// JWT path (unchanged behaviour)
-		token, err := jwt.Parse(presented, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return []byte(secret), nil
-		})
-		if err != nil || !token.Valid {
-			http.Error(w, "invalid token", http.StatusUnauthorized)
-			return
-		}
-		next(w, r)
-	}
-}
-
-// runGenJWT handles the genjwt subcommand
-func runGenJWT(args []string) {
-	var (
-		genSecret bool
-		expiry    string
-		secretDir string
-	)
-
-	fs := flag.NewFlagSet("genjwt", flag.ExitOnError)
-	fs.BoolVar(&genSecret, "gen-secret", false, "Generate new secret and save to .jwt-secret")
-	fs.StringVar(&expiry, "expiry", "1y", "Token expiry: 1y, 30d, 24h")
-	fs.StringVar(&secretDir, "dir", "/opt/ab", "Directory for .jwt-secret file")
-	fs.Parse(args)
-
-	secretPath := filepath.Join(secretDir, ".jwt-secret")
-
-	// When reading (not generating), fall back to legacy paths with a warning.
-	if !genSecret {
-		if _, err := os.Stat(secretPath); os.IsNotExist(err) {
-			for _, legacy := range jwtSecretFileLegacy {
-				if _, lerr := os.Stat(legacy); lerr == nil {
-					fmt.Fprintf(os.Stderr, "WARN: reading secret from legacy path %s — migrate to %s\n", legacy, secretPath)
-					secretPath = legacy
-					break
-				}
-			}
-		}
-	}
-
-	if genSecret {
-		// Generate random 32-byte secret
-		bytes := make([]byte, 32)
-		if _, err := rand.Read(bytes); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		secret := hex.EncodeToString(bytes)
-
-		// Ensure directory exists
-		os.MkdirAll(secretDir, 0755)
-
-		// Save to file
-		if err := os.WriteFile(secretPath, []byte(secret), 0600); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing secret: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Secret saved to %s\n", secretPath)
-		return
-	}
-
-	// Read secret from file
-	data, err := os.ReadFile(secretPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading secret from %s: %v\n", secretPath, err)
-		fmt.Fprintln(os.Stderr, "Run with -gen-secret first to generate")
-		os.Exit(1)
-	}
-	secret := strings.TrimSpace(string(data))
-
-	// Parse expiry
-	exp := parseExpiry(expiry)
-
-	// Generate token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": "ab-pty",
-		"iat": time.Now().Unix(),
-		"exp": time.Now().Add(exp).Unix(),
-	})
-
-	tokenString, err := token.SignedString([]byte(secret))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error signing: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println(tokenString)
-}
-
-func parseExpiry(s string) time.Duration {
-	if len(s) < 2 {
-		return 365 * 24 * time.Hour
-	}
-	unit := s[len(s)-1]
-	var num int
-	fmt.Sscanf(s[:len(s)-1], "%d", &num)
-	switch unit {
-	case 'y':
-		return time.Duration(num) * 365 * 24 * time.Hour
-	case 'd':
-		return time.Duration(num) * 24 * time.Hour
-	case 'h':
-		return time.Duration(num) * time.Hour
-	}
-	return 365 * 24 * time.Hour
-}
-
-// CLI helper: get local JWT token
-func getLocalJWT() string {
-	// Same search order (and AB_PTY_JWT_SECRET_PATH override) as the
-	// daemon's own jwtSecretCache.get() — see jwtSecretSearchPaths.
-	paths := jwtSecretSearchPaths()
-	var secret string
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		s := strings.TrimSpace(string(data))
-		if len(s) >= 32 {
-			secret = s
-			break
-		}
-	}
-	if secret == "" {
-		return ""
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": "ab-pty-cli",
-		"iat": time.Now().Unix(),
-		"exp": time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, _ := token.SignedString([]byte(secret))
-	return tokenString
 }
 
 // cliTLSConfig builds the HTTPS settings used by the local/in-session client.
@@ -757,10 +457,19 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 	if port == "" {
 		port = "8421"
 	}
+	sessionToken := strings.TrimSpace(os.Getenv("AB_PTY_SESSION_TOKEN"))
+	if sessionToken == "" {
+		if tlsMode() != TLSModeRequired {
+			return nil, fmt.Errorf("outside a daemon PTY, the CLI requires %s=required and an allow-listed client certificate", tlsModeEnv)
+		}
+		if strings.TrimSpace(os.Getenv(ptyClientCertEnv)) == "" || strings.TrimSpace(os.Getenv(ptyClientKeyEnv)) == "" {
+			return nil, fmt.Errorf("outside a daemon PTY, %s and %s are required; static daemon JWT authentication no longer exists", ptyClientCertEnv, ptyClientKeyEnv)
+		}
+	}
+
 	// The daemon may be serving TLS (AB_PTY_TLS_MODE != off). Its certificate
-	// is self-signed by design, so loopback calls skip verification — this is
-	// a same-host call to a socket we already trust, and the real auth is the
-	// bearer token below.
+	// is self-signed by design, so loopback calls skip verification. External
+	// callers are not supported by this local CLI helper.
 	scheme := "http"
 	if tlsMode() != TLSModeOff {
 		scheme = "https"
@@ -778,13 +487,10 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Prefer an in-session bearer token (set when running INSIDE a PTY the daemon
-	// spawned). Falls back to minting a short-lived admin JWT from the daemon
-	// secret on disk (when run ON the daemon host, e.g. from cron or sysadmin shell).
-	if tok := os.Getenv("AB_PTY_SESSION_TOKEN"); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	} else if token := getLocalJWT(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	// A bearer is only the lifecycle-bound token injected into a daemon-owned
+	// PTY. Host/operator calls authenticate exclusively with mTLS.
+	if sessionToken != "" {
+		req.Header.Set("Authorization", "Bearer "+sessionToken)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -1071,8 +777,8 @@ func runClient(args []string) {
 		runClientSessions(args[1:])
 	case "notes":
 		runClientNotes(args[1:])
-	case "add", "list", "revoke":
-		// mTLS client allow-list. `ab-pty client add|list|revoke` is the
+	case "add", "list", "role", "revoke":
+		// mTLS client allow-list. `ab-pty client add|list|role|revoke` is the
 		// documented spelling (it reads as "manage clients"); it shares the
 		// `client` namespace with the in-session API CLI above, which only
 		// ever uses the `sessions` / `notes` verbs, so there is no clash.
@@ -1546,37 +1252,35 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/info", handleInfo)
 	mux.HandleFunc("/health", handleHealth)
 
-	// Protected endpoints — accept either the daemon JWT (AB UI, admin CLI)
-	// or an in-session bearer token injected into PTY env (agent-to-daemon).
-	mux.HandleFunc("/api/pty", sessionTokenOrJwt(handleListPty))
-	mux.HandleFunc("/api/pty/", sessionTokenOrJwt(handlePtyAPI))
-	mux.HandleFunc("/api/board/items", sessionTokenOrJwt(handleBoardItems))
-	mux.HandleFunc("/api/board/items/", sessionTokenOrJwt(handleBoardItems))
-	mux.HandleFunc("/api/board/layouts", sessionTokenOrJwt(handleBoardLayouts))
-	mux.HandleFunc("/api/board/layouts/", sessionTokenOrJwt(handleBoardLayouts))
-	mux.HandleFunc("/api/projects", sessionTokenOrJwt(handleListProjects))
-	mux.HandleFunc("/api/projects/", sessionTokenOrJwt(handleProjectsAPI))
-	mux.HandleFunc("/api/sessions/", sessionTokenOrJwt(handleSessionsAPI))
-	mux.HandleFunc("/api/fs", sessionTokenOrJwt(handleFS))
-	mux.HandleFunc("/api/mkdir", sessionTokenOrJwt(handleMkdir))
-	mux.HandleFunc("/api/fs/download", sessionTokenOrJwt(handleFSDownload))
-	mux.HandleFunc("/api/fs/upload", sessionTokenOrJwt(handleFSUpload))
-	mux.HandleFunc("/api/paste-image", sessionTokenOrJwt(handlePasteImage))
-	mux.HandleFunc("/api/tunnels", sessionTokenOrJwt(handleTunnels))
-	mux.HandleFunc("/api/tunnels/", sessionTokenOrJwt(handleTunnels))
-	mux.HandleFunc("/ws", sessionTokenOrJwt(handleWebSocket))
-	mux.HandleFunc("/ws/pty-state", sessionTokenOrJwt(handlePtyState))
+	// Protected endpoints use exactly one credential path: loopback sess.* for
+	// daemon-owned PTYs, or a live role-bearing certificate on required mTLS.
+	// Safe methods admit read-only certificates; mutations require operator.
+	mux.HandleFunc("/api/pty", accessByMethod(handleListPty))
+	mux.HandleFunc("/api/pty/", accessByMethod(handlePtyAPI))
+	mux.HandleFunc("/api/board/items", accessByMethod(handleBoardItems))
+	mux.HandleFunc("/api/board/items/", accessByMethod(handleBoardItems))
+	mux.HandleFunc("/api/board/layouts", accessByMethod(handleBoardLayouts))
+	mux.HandleFunc("/api/board/layouts/", accessByMethod(handleBoardLayouts))
+	mux.HandleFunc("/api/projects", accessByMethod(handleListProjects))
+	mux.HandleFunc("/api/projects/", accessByMethod(handleProjectsAPI))
+	mux.HandleFunc("/api/sessions/", accessByMethod(handleSessionsAPI))
+	mux.HandleFunc("/api/fs", accessByMethod(handleFS))
+	mux.HandleFunc("/api/mkdir", accessByMethod(handleMkdir))
+	mux.HandleFunc("/api/fs/download", accessByMethod(handleFSDownload))
+	mux.HandleFunc("/api/fs/upload", accessByMethod(handleFSUpload))
+	mux.HandleFunc("/api/paste-image", accessByMethod(handlePasteImage))
+	mux.HandleFunc("/api/tunnels", accessByMethod(handleTunnels))
+	mux.HandleFunc("/api/tunnels/", accessByMethod(handleTunnels))
+	mux.HandleFunc("/ws", requireDaemonAccess(accessOperate, handleWebSocket))
+	mux.HandleFunc("/ws/pty-state", requireDaemonAccess(accessRead, handlePtyState))
 
-	// The machine's own client allow-list, editable only by a device this
-	// machine already admits — see clientsapi.go for the three conditions
-	// and for why this grant can never live on the relay. Wrapped in
-	// sessionTokenOrJwt as well: the certificate says who is asking, the
-	// key says they are allowed to ask for anything at all.
-	mux.HandleFunc("/api/tls/clients", sessionTokenOrJwt(requireEnrolledClient(handleTLSClients)))
-	mux.HandleFunc("/api/tls/clients/", sessionTokenOrJwt(requireEnrolledClient(handleTLSClients)))
+	// Client ACL access is admin-certificate-only. In-session tokens are
+	// deliberately operator-equivalent and cannot enter this route.
+	mux.HandleFunc("/api/tls/clients", requireDaemonAccess(accessAdmin, handleTLSClients))
+	mux.HandleFunc("/api/tls/clients/", requireDaemonAccess(accessAdmin, handleTLSClients))
 
 	// Hook endpoint — called by Claude Code hooks running inside our own
-	// PTY sessions, so it carries no JWT. requireLoopback keeps it off the
+	// PTY sessions, so it carries no credential. requireLoopback keeps it off the
 	// network: the daemon binds 0.0.0.0 and the handler mutates the
 	// claude-session→pty mapping, which a LAN neighbour must not reach.
 	mux.HandleFunc("/api/hook", requireLoopback(handleHook))
@@ -1596,7 +1300,7 @@ Usage: ab-pty [command]
 Server:
   (none)      Start the PTY daemon server
 
-Session management (no JWT needed):
+Session management (in-session token or role-bearing mTLS certificate):
   list        List active PTY sessions
   create      Create new PTY session (use -h for options)
   kill <id>   Kill session by ID or name (kills all matching names)
@@ -1607,12 +1311,12 @@ In-session API client (for use INSIDE a PTY session — auth from env):
 
 Utilities:
   version     Show version
-  genjwt      Generate JWT token (use -h for options)
   tls         Native TLS / mutual TLS (init, status, fingerprint, client)
   relay       Reach this daemon from anywhere through an ab-relay
               (connect, status, disconnect, id)
-  client add <name> <sha256>    Authorize a client certificate (mTLS allow-list)
+  client add <name> <sha256> <role>  Authorize a certificate; role is read-only|operator|admin
   client list                   List authorized client certificates
+  client role <name|sha256> <role>   Change a certificate role locally
   client revoke <name>          Revoke one (takes effect immediately)
   mcp         Run in MCP mode
   setup-mcp   Setup MCP config in claude_desktop_config.json
@@ -1621,34 +1325,33 @@ Utilities:
 Environment variables:
   AB_PTY_PORT              Server port (default: 8421)
   AB_PTY_DATABASE          SQLite database path (default: /opt/ab/data/sessions.db)
-  AB_PTY_JWT_SECRET_PATH   JWT secret file path (default: /opt/ab/.jwt-secret, then legacy paths)
   AB_PTY_SESSION_ID        (set by daemon in each PTY) caller session id
-  AB_PTY_SESSION_TOKEN     (set by daemon in each PTY) bearer for /api/pty/* calls
+  AB_PTY_SESSION_TOKEN     (set by daemon in each PTY) loopback-only lifecycle token
 
 TLS (all opt-in; the default is plain HTTP, exactly as before):
   AB_PTY_TLS_MODE          off (default) | optional | required
                            off      — plain HTTP, no certificates touched.
-                           optional — HTTPS; a client certificate is requested
-                                      but not required. Enrolment mode: the app
-                                      connects without a key so its fingerprint
-                                      can be registered.
+                           optional — HTTPS; useful for public health/info and
+                                      local in-session traffic only. Protected
+                                      external API routes remain closed.
                            required — HTTPS; the client must present a
                                       certificate whose SHA-256 fingerprint is
                                       in the allow-list, or the TLS handshake
                                       is aborted before any HTTP is served.
-  AB_PTY_TLS_CERT          Server certificate (default: <jwt-secret-dir>/tls/server.crt)
-  AB_PTY_TLS_KEY           Server key         (default: <jwt-secret-dir>/tls/server.key)
+  AB_PTY_TLS_CERT          Server certificate (default: /opt/ab/tls/server.crt)
+  AB_PTY_TLS_KEY           Server key         (default: /opt/ab/tls/server.key)
   AB_PTY_CLIENT_CERT       Client certificate used by local/in-session HTTPS calls.
   AB_PTY_CLIENT_KEY        Matching client private key; set both or neither.
   AB_PTY_TLS_ALLOW_LOOPBACK  1 = connections from 127.0.0.1/::1 may skip the
                            client certificate even in required mode (keeps the
-                           in-session 'ab' CLI and /api/hook working). Default 0.
+                           separately-authenticated in-session CLI and the
+                           loopback-only /api/hook working). Default 0.
 
 Setup:
   ab-pty tls init                        # generate the server keypair (SANs
                                          # cover localhost, 127.0.0.1, ::1, the
                                          # hostname and every interface IP)
-  ab-pty client add phone <sha256>       # authorize a client certificate
+  ab-pty client add phone <sha256> admin # authorize an ACL administrator
   AB_PTY_TLS_MODE=required ab-pty        # run locked down
 `, Version)
 			return
@@ -1664,9 +1367,6 @@ Setup:
 				os.Exit(1)
 			}
 			runKillSession(os.Args[2])
-			return
-		case "genjwt":
-			runGenJWT(os.Args[2:])
 			return
 		case "version":
 			fmt.Println(Version)
@@ -1786,7 +1486,7 @@ Setup:
 			}
 			log.Printf("TLS client auth: required, %d authorized certificate(s); loopback exempt=%v", n, tlsAllowLoopback())
 			if n == 0 {
-				log.Printf("WARN: mode=required with an empty allow-list — every client will be rejected. Add one: ab-pty client add <name> <sha256>")
+				log.Printf("WARN: mode=required with an empty allow-list — every client will be rejected. Add one: ab-pty client add <name> <sha256> <read-only|operator|admin>")
 			}
 		}
 	}
@@ -2652,8 +2352,8 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 
 	// In-session API — the agent running inside the PTY can use these to
 	// call /api/pty/* endpoints on 127.0.0.1 (or via the `ab-pty client` CLI).
-	// Token is derived from the daemon JWT secret + session id (HMAC) and is
-	// only valid while the session is alive.
+	// Token is derived from an in-memory daemon process secret + session id
+	// (HMAC) and is only valid while the session is alive.
 	if tok := deriveSessionToken(sessionID); tok != "" {
 		cmd.Env = append(cmd.Env,
 			"AB_PTY_SESSION_ID="+sessionID,
@@ -4003,7 +3703,7 @@ func setJSONHeaders(w http.ResponseWriter) {
 func setJSONCORSMethods(w http.ResponseWriter, methods string) {
 	setJSONHeaders(w)
 	w.Header().Set("Access-Control-Allow-Methods", methods)
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -4052,8 +3752,8 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TLS state is deliberately public: the client needs to know which mode
-	// the daemon is in *before* it can authenticate (in `optional` it has no
-	// certificate yet), and a server certificate fingerprint is not a secret —
+	// the daemon is in before attempting a protected request, and a server
+	// certificate fingerprint is not a secret —
 	// every peer already sees the whole certificate during the handshake.
 	info := map[string]interface{}{
 		"version":  Version,
@@ -4070,9 +3770,10 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	// "enrolled" from "tolerated because the daemon is in optional mode".
 	if r.TLS != nil {
 		info["tls_client_authorized"] = false
-		if name := tlsPeerName(r); name != "" {
+		if client, ok := tlsPeerClient(r); ok {
 			info["tls_client_authorized"] = true
-			info["tls_client_name"] = name
+			info["tls_client_name"] = client.Name
+			info["tls_client_role"] = client.Role
 		}
 	}
 	writeJSON(w, 0, info)

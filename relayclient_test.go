@@ -397,7 +397,7 @@ func dialViaRelay(r *fakeRelay) func(context.Context, string, string) (net.Conn,
 func TestRelayClientCarriesHTTP(t *testing.T) {
 	s := newRelayClientStand(t)
 	cert, fp := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", fp); err != nil {
+	if err := addAuthorizedClient("test-phone", fp, ClientRoleOperator); err != nil {
 		t.Fatal(err)
 	}
 
@@ -481,7 +481,7 @@ func TestRelayClientRejectsUnauthorizedClients(t *testing.T) {
 	// Positive control on the same path, so the two refusals above are
 	// about identity and not about broken plumbing.
 	cert, fp := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", fp); err != nil {
+	if err := addAuthorizedClient("test-phone", fp, ClientRoleOperator); err != nil {
 		t.Fatal(err)
 	}
 	good := &http.Client{
@@ -542,7 +542,7 @@ func TestRelayClientReconnects(t *testing.T) {
 
 	// And the path works again, which is the part that actually matters.
 	cert, fp := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", fp); err != nil {
+	if err := addAuthorizedClient("test-phone", fp, ClientRoleOperator); err != nil {
 		t.Fatal(err)
 	}
 	client := &http.Client{
@@ -779,7 +779,7 @@ func TestRelayManagerKeepsTwoRelaysOnlineIndependently(t *testing.T) {
 			home.fingerprint(), remote.fingerprint(), wantFP)
 	}
 	cert, clientFP := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", clientFP); err != nil {
+	if err := addAuthorizedClient("test-phone", clientFP, ClientRoleOperator); err != nil {
 		t.Fatal(err)
 	}
 	checkHealth := func(route string, relay *fakeRelay) {
@@ -912,7 +912,7 @@ func TestRelayClientCapsConcurrentStreams(t *testing.T) {
 func TestRelayClientStillServesStreamsUnderTheCap(t *testing.T) {
 	s := newRelayClientStand(t)
 	cert, fp := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", fp); err != nil {
+	if err := addAuthorizedClient("test-phone", fp, ClientRoleOperator); err != nil {
 		t.Fatal(err)
 	}
 	client := &http.Client{

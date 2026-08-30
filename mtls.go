@@ -2,9 +2,7 @@ package main
 
 // Mutual TLS for the ab-pty daemon.
 //
-// Why this exists: the daemon binds 0.0.0.0 and its only authentication is a
-// bearer JWT. Anything that can reach the port can at least probe it, and a
-// leaked JWT is game over. Historically TLS was bolted on with an external
+// Why this exists: the daemon binds 0.0.0.0. Historically TLS was bolted on with an external
 // nginx terminator (see ../CLAUDE.md, "HTTPS PTY setup"). This is the native
 // replacement — no nginx, no new Go dependencies, stdlib crypto/tls only.
 //
@@ -16,10 +14,9 @@ package main
 // self-signed peer before our code ever runs) and we use
 // RequireAnyClientCert + a custom VerifyPeerCertificate instead.
 //
-// Compatibility contract: AB_PTY_TLS_MODE defaults to "off", which is
-// byte-for-byte the previous behaviour (plain HTTP, no certificate files
-// touched, no DB writes beyond the table creation). Every new behaviour is
-// opt-in.
+// Protected external HTTP and WebSocket routes are available only on a
+// required-mTLS connection. Off/optional modes remain useful for public health
+// and local lifecycle-bound session-token traffic, never as external auth.
 
 import (
 	"crypto/rand"
@@ -28,6 +25,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/hex"
 	"encoding/pem"
 	"flag"
@@ -48,8 +46,7 @@ import (
 const (
 	// AB_PTY_TLS_MODE: off | optional | required. Default "off".
 	tlsModeEnv = "AB_PTY_TLS_MODE"
-	// AB_PTY_TLS_CERT / AB_PTY_TLS_KEY pin the server keypair to exact
-	// paths, mirroring how AB_PTY_JWT_SECRET_PATH pins the JWT secret.
+	// AB_PTY_TLS_CERT / AB_PTY_TLS_KEY pin the server keypair to exact paths.
 	tlsCertEnv = "AB_PTY_TLS_CERT"
 	tlsKeyEnv  = "AB_PTY_TLS_KEY"
 	// AB_PTY_CLIENT_CERT / AB_PTY_CLIENT_KEY identify the certificate the
@@ -92,21 +89,14 @@ func tlsMode() string {
 // own in-session CLI (`ab sessions ...`), the /api/hook endpoint used by Claude
 // Code hooks, and scripts/dev-daemon.sh all talk to the daemon over loopback
 // with no certificate of their own. It is NOT an auth bypass: those callers
-// still need a JWT or an in-session token. Default off.
+// still need an in-session token. Default off.
 func tlsAllowLoopback() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(tlsAllowLoopbackEnv)))
 	return v == "1" || v == "true" || v == "yes"
 }
 
-// tlsDefaultDir puts the keypair next to the JWT secret, under a tls/
-// subdirectory. When AB_PTY_JWT_SECRET_PATH is set (non-canonical installs,
-// e.g. the dev stand under $HOME) the certificates follow it, so an install
-// that has no /opt access does not end up with half its state in /opt.
 func tlsDefaultDir() string {
-	if p := strings.TrimSpace(os.Getenv(jwtSecretPathEnv)); p != "" {
-		return filepath.Join(filepath.Dir(p), "tls")
-	}
-	return filepath.Join(filepath.Dir(jwtSecretFileCanonical), "tls")
+	return "/opt/ab/tls"
 }
 
 func tlsCertPath() string {
@@ -180,29 +170,89 @@ func prettyFingerprint(fp string) string {
 type AuthorizedClient struct {
 	Name        string `json:"name"`
 	Fingerprint string `json:"fingerprint"`
+	Role        string `json:"role"`
 	AddedAt     string `json:"added_at"`
 	LastSeen    string `json:"last_seen,omitempty"`
+}
+
+const (
+	ClientRoleReadOnly = "read-only"
+	ClientRoleOperator = "operator"
+	ClientRoleAdmin    = "admin"
+)
+
+func normalizeClientRole(role string) (string, error) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	switch role {
+	case ClientRoleReadOnly, ClientRoleOperator, ClientRoleAdmin:
+		return role, nil
+	default:
+		return "", fmt.Errorf("invalid client role %q (want read-only|operator|admin)", role)
+	}
 }
 
 // initTLSClientsTable is called from initDB. Creating the table in "off" mode
 // too keeps `ab-pty client list` answering on an untouched install.
 func initTLSClientsTable() {
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS tls_clients (
-			fingerprint TEXT PRIMARY KEY,
-			name        TEXT NOT NULL,
-			added_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
-			last_seen   DATETIME
-		)
-	`); err != nil {
-		log.Fatal(err)
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_tls_clients_name ON tls_clients(name)`); err != nil {
+	if err := ensureTLSClientsTable(db); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func addAuthorizedClient(name, fingerprint string) error {
+func ensureTLSClientsTable(database interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+}) error {
+	if _, err := database.Exec(`
+		CREATE TABLE IF NOT EXISTS tls_clients (
+			fingerprint TEXT PRIMARY KEY,
+			name        TEXT NOT NULL,
+			role        TEXT NOT NULL DEFAULT 'operator' CHECK(role IN ('read-only','operator','admin')),
+			added_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+			last_seen   DATETIME
+		)
+	`); err != nil {
+		return err
+	}
+	// Existing allow-lists predate roles. Preserve ordinary daemon access but
+	// never silently elevate those rows to ACL administrators.
+	rows, err := database.Query(`PRAGMA table_info(tls_clients)`)
+	if err != nil {
+		return err
+	}
+	hasRole := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, pk int
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "role" {
+			hasRole = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !hasRole {
+		if _, err := database.Exec(`ALTER TABLE tls_clients ADD COLUMN role TEXT NOT NULL DEFAULT 'operator'`); err != nil {
+			return err
+		}
+	}
+	if _, err := database.Exec(`CREATE INDEX IF NOT EXISTS idx_tls_clients_name ON tls_clients(name)`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func addAuthorizedClient(name, fingerprint, role string) error {
 	fp, err := normalizeFingerprint(fingerprint)
 	if err != nil {
 		return err
@@ -211,15 +261,42 @@ func addAuthorizedClient(name, fingerprint string) error {
 	if name == "" {
 		return fmt.Errorf("client name must not be empty")
 	}
+	role, err = normalizeClientRole(role)
+	if err != nil {
+		return err
+	}
 	_, err = db.Exec(
-		`INSERT INTO tls_clients (fingerprint, name, added_at) VALUES (?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(fingerprint) DO UPDATE SET name = excluded.name`,
-		fp, name)
+		`INSERT INTO tls_clients (fingerprint, name, role, added_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(fingerprint) DO UPDATE SET name = excluded.name, role = excluded.role`,
+		fp, name, role)
 	return err
 }
 
+func setAuthorizedClientRole(nameOrFingerprint, role string) (int64, error) {
+	role, err := normalizeClientRole(role)
+	if err != nil {
+		return 0, err
+	}
+	target := strings.TrimSpace(nameOrFingerprint)
+	res, err := db.Exec(`UPDATE tls_clients SET role = ? WHERE name = ?`, role, target)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		if fp, ferr := normalizeFingerprint(target); ferr == nil {
+			res, err = db.Exec(`UPDATE tls_clients SET role = ? WHERE fingerprint = ?`, role, fp)
+			if err != nil {
+				return 0, err
+			}
+			n, _ = res.RowsAffected()
+		}
+	}
+	return n, nil
+}
+
 func listAuthorizedClients() ([]AuthorizedClient, error) {
-	rows, err := db.Query(`SELECT name, fingerprint, COALESCE(added_at,''), COALESCE(last_seen,'')
+	rows, err := db.Query(`SELECT name, fingerprint, role, COALESCE(added_at,''), COALESCE(last_seen,'')
 	                       FROM tls_clients ORDER BY added_at`)
 	if err != nil {
 		return nil, err
@@ -228,7 +305,7 @@ func listAuthorizedClients() ([]AuthorizedClient, error) {
 	out := []AuthorizedClient{}
 	for rows.Next() {
 		var c AuthorizedClient
-		if err := rows.Scan(&c.Name, &c.Fingerprint, &c.AddedAt, &c.LastSeen); err != nil {
+		if err := rows.Scan(&c.Name, &c.Fingerprint, &c.Role, &c.AddedAt, &c.LastSeen); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -262,16 +339,21 @@ func revokeAuthorizedClient(nameOrFingerprint string) (int64, error) {
 // no cache — so `ab-pty client revoke` takes effect on the very next
 // connection without restarting the daemon. Handshakes are rare compared to
 // the cost of a primary-key lookup.
-func lookupAuthorizedClient(fp string) (string, bool) {
+func lookupAuthorizedClient(fp string) (AuthorizedClient, bool) {
 	if db == nil {
-		return "", false
+		return AuthorizedClient{}, false
 	}
-	var name string
-	err := db.QueryRow(`SELECT name FROM tls_clients WHERE fingerprint = ?`, fp).Scan(&name)
+	var client AuthorizedClient
+	err := db.QueryRow(`SELECT name, fingerprint, role, COALESCE(added_at,''), COALESCE(last_seen,'') FROM tls_clients WHERE fingerprint = ?`, fp).
+		Scan(&client.Name, &client.Fingerprint, &client.Role, &client.AddedAt, &client.LastSeen)
 	if err != nil {
-		return "", false
+		return AuthorizedClient{}, false
 	}
-	return name, true
+	if _, err := normalizeClientRole(client.Role); err != nil {
+		log.Printf("tls: rejecting allow-list row %s with invalid role %q", prettyFingerprint(fp), client.Role)
+		return AuthorizedClient{}, false
+	}
+	return client, true
 }
 
 // touchAuthorizedClient records a successful handshake. Fired off the
@@ -474,9 +556,8 @@ func buildTLSConfigWithLoopback(mode string, allowLoopback bool) (*tls.Config, e
 		switch effective {
 		case TLSModeOptional:
 			// RequestClientCert: ask, but a client with nothing to show
-			// still completes the handshake. This is the enrolment mode —
-			// the app connects before it owns a key so the operator can
-			// read its fingerprint and register it.
+			// still completes the handshake. Protected external routes reject
+			// this mode; only public and local in-session traffic can use it.
 			c.ClientAuth = tls.RequestClientCert
 		case TLSModeRequired:
 			// RequireAnyClientCert, deliberately NOT
@@ -519,20 +600,20 @@ func makePeerVerifier(mode string, peer string) func([][]byte, [][]*x509.Certifi
 		if c, err := x509.ParseCertificate(rawCerts[0]); err == nil {
 			subject = c.Subject.CommonName
 		}
-		name, ok := lookupAuthorizedClient(fp)
+		client, ok := lookupAuthorizedClient(fp)
 		if ok {
 			touchAuthorizedClient(fp)
-			log.Printf("tls: accept %s — client %q (sha256 %s)", peer, name, prettyFingerprint(fp))
+			log.Printf("tls: accept %s — client %q role=%s (sha256 %s)", peer, client.Name, client.Role, prettyFingerprint(fp))
 			return nil
 		}
 		if mode == TLSModeRequired {
 			log.Printf("tls: REJECT %s — client certificate not in allow-list (CN=%q sha256 %s). "+
-				"Authorize it with: ab-pty client add <name> %s",
+				"Authorize it with: ab-pty client add <name> %s <read-only|operator|admin>",
 				peer, subject, prettyFingerprint(fp), fp)
 			return fmt.Errorf("client certificate %s is not authorized", fp)
 		}
 		log.Printf("tls: accept %s (mode=optional) — UNKNOWN client certificate (CN=%q sha256 %s). "+
-			"To authorize: ab-pty client add <name> %s", peer, subject, prettyFingerprint(fp), fp)
+			"To authorize: ab-pty client add <name> %s <read-only|operator|admin>", peer, subject, prettyFingerprint(fp), fp)
 		return nil
 	}
 }
@@ -576,15 +657,14 @@ func isRelayRequest(r *http.Request) bool {
 	return strings.HasPrefix(host, relayNetwork+"/")
 }
 
-// tlsPeerName returns the allow-listed name for the certificate on this
+// tlsPeerClient returns the live allow-list row for the certificate on this
 // request, if any. Used by /info so the app can tell "my cert is registered"
 // from "my cert is being tolerated because the daemon is in optional mode".
-func tlsPeerName(r *http.Request) string {
+func tlsPeerClient(r *http.Request) (AuthorizedClient, bool) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		return ""
+		return AuthorizedClient{}, false
 	}
-	name, _ := lookupAuthorizedClient(certFingerprint(r.TLS.PeerCertificates[0].Raw))
-	return name
+	return lookupAuthorizedClient(certFingerprint(r.TLS.PeerCertificates[0].Raw))
 }
 
 // --- subcommands ----------------------------------------------------------
@@ -603,10 +683,11 @@ const tlsUsage = `ab-pty tls — native TLS / mutual-TLS for the daemon
   ab-pty tls fingerprint
         Print the server certificate's SHA-256 fingerprint (hex, no colons).
 
-Client allow-list (see also the top-level aliases: ab-pty client add|list|revoke):
+Client allow-list (see also the top-level aliases):
 
-  ab-pty tls client add <name> <sha256-fingerprint>
+  ab-pty tls client add <name> <sha256-fingerprint> <read-only|operator|admin>
   ab-pty tls client list
+  ab-pty tls client role <name|fingerprint> <read-only|operator|admin>
   ab-pty tls client revoke <name|fingerprint>
 
 Environment:
@@ -617,6 +698,9 @@ Environment:
   AB_PTY_CLIENT_CERT         client certificate presented by the local CLI
   AB_PTY_CLIENT_KEY          matching client private key (set both or neither)
   AB_PTY_DATABASE            SQLite DB holding the client allow-list
+
+Protected external API routes require mode=required. off/optional never
+fall back to a bearer token or another external authentication mechanism.
 `
 
 func runTLS(args []string) {
@@ -733,28 +817,29 @@ func runTLSFingerprint() {
 	fmt.Println(fp)
 }
 
-// runTLSClient implements add/list/revoke. It opens the daemon's DB directly
+// runTLSClient implements add/list/role/revoke. It opens the daemon's DB directly
 // rather than going through the HTTP API: it has to work when the daemon is
 // stopped (initial enrolment) and when the daemon is in required mode and
 // would refuse the CLI's own certificate-less connection.
 func runTLSClient(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: ab-pty client <add|list|revoke> ...")
+		fmt.Fprintln(os.Stderr, "usage: ab-pty client <add|list|role|revoke> ...")
 		os.Exit(2)
 	}
 	initDB()
 	switch args[0] {
 	case "add":
-		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: ab-pty client add <name> <sha256-fingerprint>")
+		if len(args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: ab-pty client add <name> <sha256-fingerprint> <read-only|operator|admin>")
 			os.Exit(2)
 		}
-		if err := addAuthorizedClient(args[1], args[2]); err != nil {
+		if err := addAuthorizedClient(args[1], args[2], args[3]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 		fp, _ := normalizeFingerprint(args[2])
-		fmt.Printf("Authorized client %q: %s\n", args[1], prettyFingerprint(fp))
+		role, _ := normalizeClientRole(args[3])
+		fmt.Printf("Authorized client %q as %s: %s\n", args[1], role, prettyFingerprint(fp))
 	case "list":
 		clients, err := listAuthorizedClients()
 		if err != nil {
@@ -762,17 +847,33 @@ func runTLSClient(args []string) {
 			os.Exit(1)
 		}
 		if len(clients) == 0 {
-			fmt.Println("No authorized clients. Add one: ab-pty client add <name> <sha256-fingerprint>")
+			fmt.Println("No authorized clients. Add one: ab-pty client add <name> <sha256-fingerprint> <role>")
 			return
 		}
-		fmt.Printf("%-20s %-24s %-24s %s\n", "NAME", "ADDED", "LAST SEEN", "SHA-256")
+		fmt.Printf("%-20s %-10s %-24s %-24s %s\n", "NAME", "ROLE", "ADDED", "LAST SEEN", "SHA-256")
 		for _, c := range clients {
 			seen := c.LastSeen
 			if seen == "" {
 				seen = "never"
 			}
-			fmt.Printf("%-20s %-24s %-24s %s\n", c.Name, c.AddedAt, seen, prettyFingerprint(c.Fingerprint))
+			fmt.Printf("%-20s %-10s %-24s %-24s %s\n", c.Name, c.Role, c.AddedAt, seen, prettyFingerprint(c.Fingerprint))
 		}
+	case "role":
+		if len(args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: ab-pty client role <name|fingerprint> <read-only|operator|admin>")
+			os.Exit(2)
+		}
+		n, err := setAuthorizedClientRole(args[1], args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if n == 0 {
+			fmt.Fprintf(os.Stderr, "No authorized client matched %q\n", args[1])
+			os.Exit(1)
+		}
+		role, _ := normalizeClientRole(args[2])
+		fmt.Printf("Changed %d client certificate(s) matching %q to role %s — effective immediately.\n", n, args[1], role)
 	case "revoke":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: ab-pty client revoke <name|fingerprint>")

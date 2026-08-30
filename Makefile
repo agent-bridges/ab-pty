@@ -15,5 +15,4 @@ version:
 # Subcommands:
 #   ./ab-pty                     - run daemon
 #   ./ab-pty version             - show version
-#   ./ab-pty genjwt -gen-secret  - generate secret to .jwt-secret
-#   ./ab-pty genjwt              - generate token from secret
+#   ./ab-pty client add phone <sha256> operator  - authorize normal daemon use

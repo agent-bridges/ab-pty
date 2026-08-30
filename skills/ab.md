@@ -94,12 +94,14 @@ Default to **send** if unsure — it matches the natural reading of "send to X" 
 - `ab` only reaches sessions on the SAME PTY daemon as yours (v1). To send to
   a session on a different host, ask the user to configure cross-daemon peering.
 - `ab sessions write` does not append Enter; `ab sessions send` does.
-- The session token is bound to YOUR session's lifetime. If your session ends,
-  the token stops working.
+- The loopback-only session token is bound to YOUR session and this daemon
+  process. Ending the session or restarting the daemon invalidates it.
 - When daemon TLS is `required` and loopback exemption is disabled, configure
   both `AB_PTY_CLIENT_CERT` and `AB_PTY_CLIENT_KEY` on the daemon. It propagates
   them into child PTYs, and the in-session CLI presents that certificate on
   HTTPS calls. The certificate must be present in the daemon client allow-list.
+- External daemon API calls never accept bearer/JWT authentication. They need
+  required mTLS and a live allow-list role (`read-only`, `operator`, or `admin`).
 
 ---
 

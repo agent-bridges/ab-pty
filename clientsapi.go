@@ -18,7 +18,7 @@ package main
 // a certificate this machine itself decided to trust, presented on the
 // connection carrying the request.
 //
-// ### The three conditions, and why each one is separate
+// ### The authorization conditions
 //
 //  1. **The request arrived over TLS with a client certificate this daemon
 //     authorises.** Not "some certificate" — the same lookup the handshake
@@ -33,10 +33,9 @@ package main
 //     already stopped enforcing. Refusing here rather than trusting the check
 //     is the difference between a rule and a habit.
 //
-//  3. **A valid key** (the daemon JWT or an in-session token), because the
-//     wrapper this is registered under demands one. Enrolment is durable
-//     access to a whole machine; it should cost at least as much as reading
-//     the session list.
+//  3. **The live allow-list row has role `admin`.** An operator can use the
+//     daemon but cannot grant that access to another certificate. An internal
+//     session token is operator-equivalent and therefore cannot enter here.
 //
 // The loopback exemption (AB_PTY_TLS_ALLOW_LOOPBACK) is deliberately no help
 // here. It lets a local caller through the handshake without a certificate; it
@@ -48,10 +47,26 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
 )
+
+func decodeClientAdminBody(w http.ResponseWriter, r *http.Request, dst interface{}) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
+}
 
 // tlsCallerFingerprint returns the fingerprint of the certificate on this
 // request, or "" when there is none.
@@ -62,57 +77,16 @@ func tlsCallerFingerprint(r *http.Request) string {
 	return certFingerprint(r.TLS.PeerCertificates[0].Raw)
 }
 
-// requireEnrolledClient enforces conditions 1 and 2 above.
-//
-// The refusals are worded and separated on purpose: an app that cannot tell
-// "this daemon is not locked down" from "you are not on its list" tells its
-// user to fix the wrong machine.
-func requireEnrolledClient(next func(http.ResponseWriter, *http.Request, AuthorizedClient)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		setJSONHeaders(w)
-		if mode := effectiveTLSMode(r); mode != TLSModeRequired {
-			// In "optional" the allow-list is not being enforced, so a
-			// caller being on it proves nothing about anybody else's
-			// ability to reach this endpoint.
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error":     "the client allow-list may only be changed over a connection where a client certificate was mandatory",
-				"code":      "tls_mode",
-				"tls_mode":  mode,
-				"remediate": "start the daemon with AB_PTY_TLS_MODE=required",
-			})
-			return
-		}
-		fp := tlsCallerFingerprint(r)
-		if fp == "" {
-			// No certificate at all: a plain connection, or the loopback
-			// exemption. Either way there is nobody here this daemon has
-			// decided to trust.
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error":     "this request presented no client certificate",
-				"code":      "no_client_certificate",
-				"remediate": "ab-pty client add <name> <sha256>, on this machine",
-			})
-			return
-		}
-		name, ok := lookupAuthorizedClient(fp)
-		if !ok {
-			log.Printf("tls: REJECT allow-list change from an unauthorized certificate (sha256 %s)", prettyFingerprint(fp))
-			writeJSON(w, http.StatusForbidden, map[string]string{
-				"error":       "this certificate is not on this machine's allow-list",
-				"code":        "not_authorized",
-				"fingerprint": fp,
-				"remediate":   fmt.Sprintf("ab-pty client add <name> %s, on this machine", fp),
-			})
-			return
-		}
-		next(w, r, AuthorizedClient{Name: name, Fingerprint: fp})
-	}
-}
-
 // handleTLSClients serves the machine's own allow-list: read it, add to it,
-// and (via /api/tls/clients/<name|fingerprint>) remove from it.
-func handleTLSClients(w http.ResponseWriter, r *http.Request, caller AuthorizedClient) {
-	if allowOptions(w, r, "GET, POST, DELETE, OPTIONS") {
+// change roles, and (via /api/tls/clients/<name|fingerprint>) remove from it.
+func handleTLSClients(w http.ResponseWriter, r *http.Request) {
+	principal, ok := principalFromRequest(r)
+	if !ok || principal.Client.Fingerprint == "" {
+		writeError(w, http.StatusForbidden, "admin client certificate required")
+		return
+	}
+	caller := principal.Client
+	if allowOptions(w, r, "GET, POST, PATCH, DELETE, OPTIONS") {
 		return
 	}
 	target := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/tls/clients"), "/")
@@ -122,6 +96,8 @@ func handleTLSClients(w http.ResponseWriter, r *http.Request, caller AuthorizedC
 		listTLSClients(w, caller)
 	case r.Method == http.MethodPost && target == "":
 		addTLSClient(w, r, caller)
+	case r.Method == http.MethodPatch && target != "":
+		changeTLSClientRole(w, r, caller, target)
 	case r.Method == http.MethodDelete && target != "":
 		revokeTLSClient(w, caller, target)
 	default:
@@ -140,6 +116,7 @@ func listTLSClients(w http.ResponseWriter, caller AuthorizedClient) {
 		rows = append(rows, map[string]interface{}{
 			"name":        c.Name,
 			"fingerprint": c.Fingerprint,
+			"role":        c.Role,
 			"added_at":    c.AddedAt,
 			"last_seen":   c.LastSeen,
 			// Which of these is the caller. A phone has no other way to
@@ -149,16 +126,17 @@ func listTLSClients(w http.ResponseWriter, caller AuthorizedClient) {
 			"self": strings.EqualFold(c.Fingerprint, caller.Fingerprint),
 		})
 	}
-	writeJSON(w, 0, map[string]interface{}{"clients": rows, "caller": caller.Name})
+	writeJSON(w, 0, map[string]interface{}{"clients": rows, "caller": caller.Name, "caller_role": caller.Role})
 }
 
 func addTLSClient(w http.ResponseWriter, r *http.Request, caller AuthorizedClient) {
 	var body struct {
 		Name        string `json:"name"`
 		Fingerprint string `json:"fingerprint"`
+		Role        string `json:"role"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "expected {\"name\":…, \"fingerprint\":…}")
+	if err := decodeClientAdminBody(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "expected {\"name\":…, \"fingerprint\":…, \"role\":\"read-only|operator|admin\"}")
 		return
 	}
 	fp, err := normalizeFingerprint(body.Fingerprint)
@@ -171,20 +149,53 @@ func addTLSClient(w http.ResponseWriter, r *http.Request, caller AuthorizedClien
 		writeError(w, http.StatusBadRequest, "a name is required — it is what a later revocation is aimed at")
 		return
 	}
-	if err := addAuthorizedClient(name, fp); err != nil {
+	role, err := normalizeClientRole(body.Role)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := addAuthorizedClient(name, fp, role); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	// Logged with both parties: an allow-list gaining an entry is the one
 	// event on this daemon that a person may later need to account for, and
 	// "who let this in" has to be answerable from the journal alone.
-	log.Printf("tls: client %q (sha256 %s) authorized client %q (sha256 %s) over mutual TLS",
-		caller.Name, prettyFingerprint(caller.Fingerprint), name, prettyFingerprint(fp))
+	log.Printf("tls: admin client %q (sha256 %s) authorized client %q role=%s (sha256 %s) over mutual TLS",
+		caller.Name, prettyFingerprint(caller.Fingerprint), name, role, prettyFingerprint(fp))
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"name":        name,
 		"fingerprint": fp,
+		"role":        role,
 		"added_by":    caller.Name,
 	})
+}
+
+func changeTLSClientRole(w http.ResponseWriter, r *http.Request, caller AuthorizedClient, target string) {
+	var body struct {
+		Role string `json:"role"`
+	}
+	if err := decodeClientAdminBody(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "expected {\"role\":\"read-only|operator|admin\"}")
+		return
+	}
+	role, err := normalizeClientRole(body.Role)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	n, err := setAuthorizedClientRole(target, role)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not change client role")
+		return
+	}
+	if n == 0 {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no authorized client matched %q", target))
+		return
+	}
+	log.Printf("tls: admin client %q changed %d client certificate(s) matching %q to role %s over mutual TLS",
+		caller.Name, n, target, role)
+	writeJSON(w, 0, map[string]interface{}{"updated": n, "role": role, "updated_by": caller.Name})
 }
 
 func revokeTLSClient(w http.ResponseWriter, caller AuthorizedClient, target string) {

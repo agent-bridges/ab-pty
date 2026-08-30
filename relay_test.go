@@ -118,7 +118,7 @@ func TestRelayRequiresClientCertRegardlessOfMode(t *testing.T) {
 	// Positive control on the very same listener: the refusal above is about
 	// the missing certificate and not about the plumbing.
 	cert, fp := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", fp); err != nil {
+	if err := addAuthorizedClient("test-phone", fp, ClientRoleOperator); err != nil {
 		t.Fatalf("authorizing client: %v", err)
 	}
 	resp, err = rt.client([]tls.Certificate{cert}).Get("https://relay/info")
@@ -153,7 +153,7 @@ func TestRelayAcceptsAuthorizedClient(t *testing.T) {
 	rt := newRelayTestServer(t)
 
 	cert, fp := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", fp); err != nil {
+	if err := addAuthorizedClient("test-phone", fp, ClientRoleOperator); err != nil {
 		t.Fatalf("authorizing client: %v", err)
 	}
 
@@ -194,7 +194,7 @@ func TestRelayCannotReachHookEvenWithLoopbackExemption(t *testing.T) {
 	rt := newRelayTestServer(t)
 
 	cert, fp := newClientCert(t)
-	if err := addAuthorizedClient("test-phone", fp); err != nil {
+	if err := addAuthorizedClient("test-phone", fp, ClientRoleOperator); err != nil {
 		t.Fatalf("authorizing client: %v", err)
 	}
 	client := rt.client([]tls.Certificate{cert})
