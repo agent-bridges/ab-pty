@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -93,6 +95,13 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestCliTLSConfigRequiresCompleteValidKeypair(t *testing.T) {
+	dir := t.TempDir()
+	serverCert := filepath.Join(dir, "server.crt")
+	serverKey := filepath.Join(dir, "server.key")
+	if err := generateSelfSignedCert(serverCert, serverKey, []string{"localhost"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tlsCertEnv, serverCert)
 	t.Setenv(ptyClientCertEnv, "/tmp/client.crt")
 	t.Setenv(ptyClientKeyEnv, "")
 	if _, err := cliTLSConfig(); err == nil || !strings.Contains(err.Error(), ptyClientKeyEnv+" is missing") {
@@ -147,6 +156,7 @@ func TestCliRequestPresentsConfiguredClientCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(tlsModeEnv, TLSModeRequired)
+	t.Setenv(tlsCertEnv, serverCert)
 	t.Setenv("AB_PTY_PORT", port)
 	t.Setenv(ptyClientCertEnv, clientCert)
 	t.Setenv(ptyClientKeyEnv, clientKey)
@@ -160,7 +170,7 @@ func TestCliRequestPresentsConfiguredClientCertificate(t *testing.T) {
 	}
 }
 
-func TestCreatePtySessionPropagatesClientCertificateEnvironment(t *testing.T) {
+func TestCreatePtySessionPropagatesLocalDaemonMTLSEnvironment(t *testing.T) {
 	initTestDB()
 	sessionsMu.Lock()
 	sessions = make(map[string]*Session)
@@ -168,6 +178,9 @@ func TestCreatePtySessionPropagatesClientCertificateEnvironment(t *testing.T) {
 
 	t.Setenv(ptyClientCertEnv, "/state/client-certs/local.crt")
 	t.Setenv(ptyClientKeyEnv, "/state/client-certs/local.key")
+	t.Setenv(tlsModeEnv, TLSModeRequired)
+	t.Setenv(tlsCertEnv, "/state/tls/server.crt")
+	t.Setenv("AB_PTY_PORT", "19421")
 	session, err := createPtySession("/tmp", 24, 80, "tls-child", "", true, "pty_tls_env_10001", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -183,6 +196,84 @@ func TestCreatePtySessionPropagatesClientCertificateEnvironment(t *testing.T) {
 	}
 	if env[ptyClientCertEnv] != "/state/client-certs/local.crt" || env[ptyClientKeyEnv] != "/state/client-certs/local.key" {
 		t.Fatalf("client identity was not propagated: cert=%q key=%q", env[ptyClientCertEnv], env[ptyClientKeyEnv])
+	}
+	if env[tlsCertEnv] != "/state/tls/server.crt" || env[tlsModeEnv] != TLSModeRequired || env["AB_PTY_PORT"] != "19421" {
+		t.Fatalf("daemon TLS endpoint was not propagated: ca=%q mode=%q port=%q", env[tlsCertEnv], env[tlsModeEnv], env["AB_PTY_PORT"])
+	}
+}
+
+func TestCliTLSConfigRejectsWrongServerTrust(t *testing.T) {
+	dir := t.TempDir()
+	trustedCert := filepath.Join(dir, "trusted.crt")
+	trustedKey := filepath.Join(dir, "trusted.key")
+	actualCert := filepath.Join(dir, "actual.crt")
+	actualKey := filepath.Join(dir, "actual.key")
+	if err := generateSelfSignedCert(trustedCert, trustedKey, []string{"localhost"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := generateSelfSignedCert(actualCert, actualKey, []string{"localhost"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	pair, err := tls.LoadX509KeyPair(actualCert, actualKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("unexpected")) }))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	defer server.Close()
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(tlsModeEnv, TLSModeOptional)
+	t.Setenv(tlsCertEnv, trustedCert)
+	t.Setenv("AB_PTY_PORT", port)
+	t.Setenv("AB_PTY_SESSION_TOKEN", "sess.invalid.invalid")
+	if _, err := cliRequest(http.MethodGet, "/", nil); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("wrong daemon certificate was not rejected: %v", err)
+	}
+}
+
+func TestClaudeHookForwarderRequiresAndUsesMTLS(t *testing.T) {
+	dir := t.TempDir()
+	capture := filepath.Join(dir, "curl.args")
+	fakeCurl := filepath.Join(dir, "curl")
+	if err := os.WriteFile(fakeCurl, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "claude-hook-forwarder.sh")
+	cmd.Stdin = strings.NewReader(`{"hook_event_name":"Stop"}`)
+	cmd.Env = append(os.Environ(),
+		"PATH="+dir+":"+os.Getenv("PATH"),
+		"CAPTURE="+capture,
+		"AB_PTY_TLS_MODE=required",
+		"AB_PTY_TLS_CERT=/state/tls/server.crt",
+		"AB_PTY_CLIENT_CERT=/state/client/local.crt",
+		"AB_PTY_CLIENT_KEY=/state/client/local.key",
+		"AB_PTY_PORT=19421",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hook forwarder failed: %v: %s", err, out)
+	}
+	args, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(args)
+	for _, want := range []string{"--cert\n/state/client/local.crt", "--key\n/state/client/local.key", "--cacert\n/state/tls/server.crt", "--proto\n=https", "https://localhost:19421/api/hook"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("hook curl args lack %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestClaudeHookForwarderFailsClosedWithoutMTLSIdentity(t *testing.T) {
+	cmd := exec.Command("bash", "claude-hook-forwarder.sh")
+	cmd.Stdin = strings.NewReader(`{"hook_event_name":"Stop"}`)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "AB_PTY_TLS_MODE=required", "AB_PTY_TLS_CERT=/state/tls/server.crt"}
+	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), ptyClientCertEnv) {
+		t.Fatalf("hook did not fail closed for missing identity: err=%v output=%s", err, out)
 	}
 }
 

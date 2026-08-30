@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	_ "embed"
 	"encoding/base64"
@@ -421,10 +422,10 @@ func requireLoopback(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // cliTLSConfig builds the HTTPS settings used by the local/in-session client.
-// The daemon's server certificate is self-signed by design, so loopback server
-// verification remains disabled as before. When a client identity is
-// configured, both files are mandatory and are loaded before any network I/O
-// so configuration errors are direct and actionable.
+// The daemon's server certificate is self-signed by design. The local client
+// trusts exactly AB_PTY_TLS_CERT (or its canonical default), never the system
+// roots and never InsecureSkipVerify. When a client identity is configured,
+// both files are mandatory and loaded before any network I/O.
 func cliTLSConfig() (*tls.Config, error) {
 	certPath := strings.TrimSpace(os.Getenv(ptyClientCertEnv))
 	keyPath := strings.TrimSpace(os.Getenv(ptyClientKeyEnv))
@@ -436,9 +437,19 @@ func cliTLSConfig() (*tls.Config, error) {
 		return nil, fmt.Errorf("%s and %s must be configured together for HTTPS: %s is missing", ptyClientCertEnv, ptyClientKeyEnv, missing)
 	}
 
+	serverCertPath := tlsCertPath()
+	serverPEM, err := os.ReadFile(serverCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("read daemon server certificate (%s=%q): %w", tlsCertEnv, serverCertPath, err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(serverPEM) {
+		return nil, fmt.Errorf("daemon server certificate %q is not valid PEM", serverCertPath)
+	}
 	config := &tls.Config{
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12,
+		RootCAs:    roots,
+		ServerName: "localhost",
+		MinVersion: tls.VersionTLS12,
 	}
 	if certPath == "" {
 		return config, nil
@@ -458,6 +469,9 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 		port = "8421"
 	}
 	sessionToken := strings.TrimSpace(os.Getenv("AB_PTY_SESSION_TOKEN"))
+	if tlsMode() == TLSModeRequired && (strings.TrimSpace(os.Getenv(ptyClientCertEnv)) == "" || strings.TrimSpace(os.Getenv(ptyClientKeyEnv)) == "") {
+		return nil, fmt.Errorf("%s=required needs %s and %s for local mutual TLS", tlsModeEnv, ptyClientCertEnv, ptyClientKeyEnv)
+	}
 	if sessionToken == "" {
 		if tlsMode() != TLSModeRequired {
 			return nil, fmt.Errorf("outside a daemon PTY, the CLI requires %s=required and an allow-listed client certificate", tlsModeEnv)
@@ -467,9 +481,8 @@ func cliRequest(method, path string, body []byte) ([]byte, error) {
 		}
 	}
 
-	// The daemon may be serving TLS (AB_PTY_TLS_MODE != off). Its certificate
-	// is self-signed by design, so loopback calls skip verification. External
-	// callers are not supported by this local CLI helper.
+	// The daemon may be serving TLS (AB_PTY_TLS_MODE != off). Its exact
+	// self-signed certificate is verified by cliTLSConfig.
 	scheme := "http"
 	if tlsMode() != TLSModeOff {
 		scheme = "https"
@@ -2268,13 +2281,25 @@ func expandPath(path string) string {
 	return path
 }
 
-func appendConfiguredPtyClientIdentity(env []string) []string {
+func appendConfiguredPtyDaemonEnv(env []string) []string {
+	env = append(env,
+		tlsModeEnv+"="+tlsMode(),
+		tlsCertEnv+"="+tlsCertPath(),
+		"AB_PTY_PORT="+daemonPort(),
+	)
 	for _, key := range []string{ptyClientCertEnv, ptyClientKeyEnv} {
 		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 			env = append(env, key+"="+value)
 		}
 	}
 	return env
+}
+
+func daemonPort() string {
+	if port := strings.TrimSpace(os.Getenv("AB_PTY_PORT")); port != "" {
+		return port
+	}
+	return "8421"
 }
 
 func createPtySession(projectPath string, rows, cols int, name, continueSession string, shellOnly bool, sessionID string, customCmd []string) (*Session, error) {
@@ -2360,19 +2385,10 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 			"AB_PTY_SESSION_TOKEN="+tok,
 		)
 	}
-	// The in-session CLI builds its own URL — it needs the scheme, not just
-	// the port, or it will speak plain HTTP to a TLS listener.
-	if m := tlsMode(); m != TLSModeOff {
-		cmd.Env = append(cmd.Env, tlsModeEnv+"="+m)
-	}
-	// Expose the daemon's listening port so the CLI default target is correct.
-	if port := os.Getenv("AB_PTY_PORT"); port != "" {
-		cmd.Env = append(cmd.Env, "AB_PTY_PORT="+port)
-	}
-	// Required-mode loopback calls still need mutual TLS when the exemption is
-	// disabled. Propagate the daemon-configured local client identity into every
-	// child, including shell sessions whose environment is otherwise minimal.
-	cmd.Env = appendConfiguredPtyClientIdentity(cmd.Env)
+	// The local CLI and Claude hook need the exact port, TLS mode, server trust
+	// anchor and client identity. Propagate them into every child, including
+	// shell sessions whose environment is otherwise minimal.
+	cmd.Env = appendConfiguredPtyDaemonEnv(cmd.Env)
 
 	if shouldUseCodexAppServer(customCmd) {
 		sessionEnv := append([]string(nil), cmd.Env...)

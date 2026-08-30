@@ -97,9 +97,10 @@ Default to **send** if unsure — it matches the natural reading of "send to X" 
 - The loopback-only session token is bound to YOUR session and this daemon
   process. Ending the session or restarting the daemon invalidates it.
 - When daemon TLS is `required` and loopback exemption is disabled, configure
-  both `AB_PTY_CLIENT_CERT` and `AB_PTY_CLIENT_KEY` on the daemon. It propagates
-  them into child PTYs, and the in-session CLI presents that certificate on
-  HTTPS calls. The certificate must be present in the daemon client allow-list.
+  `AB_PTY_TLS_CERT`, `AB_PTY_CLIENT_CERT`, and `AB_PTY_CLIENT_KEY` on the
+  daemon. It propagates them with `AB_PTY_TLS_MODE` and `AB_PTY_PORT` into
+  child PTYs. The local CLI and hook verify the exact server certificate and
+  present the allow-listed client certificate; there is no insecure fallback.
 - External daemon API calls never accept bearer/JWT authentication. They need
   required mTLS and a live allow-list role (`read-only`, `operator`, or `admin`).
 

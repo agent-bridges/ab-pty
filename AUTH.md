@@ -51,3 +51,18 @@ certificates. A session end or daemon restart invalidates it.
 
 An `Authorization` header selects this internal path. Invalid, remote or
 non-`sess.*` authorization is rejected and never retried as certificate auth.
+
+When the daemon runs in `required` mode without the relay-incompatible
+loopback exemption, local CLI and Claude hook connections also use mTLS. The
+daemon propagates these exact values into every child PTY:
+
+- `AB_PTY_TLS_MODE=required`
+- `AB_PTY_PORT` (the actual listener port, default `8421`)
+- `AB_PTY_TLS_CERT` (the exact self-signed server certificate trusted for
+  `localhost`; no system-root or insecure fallback)
+- `AB_PTY_CLIENT_CERT` and `AB_PTY_CLIENT_KEY` (an allow-listed local client
+  identity)
+
+`claude-hook-forwarder.sh` refuses to run without this contract and posts to
+`https://localhost:$AB_PTY_PORT/api/hook` using `curl --cert`, `--key`, and
+`--cacert`; it never uses `-k`.
