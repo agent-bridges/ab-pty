@@ -2744,6 +2744,17 @@ func readPtyLoop(session *Session) {
 	broadcastPtyState()
 }
 
+// markSessionInput is the one definition of "the user just submitted work"
+// for Codex's heuristic status. Terminal websocket input used to be the only
+// caller, which meant the AB CLI and mobile command bar could successfully
+// submit through POST /stdin while every observer kept showing `idle`.
+func markSessionInput(session *Session) {
+	session.mu.Lock()
+	session.LastInputAt = time.Now()
+	session.LastOutputDigest = ""
+	session.mu.Unlock()
+}
+
 func broadcastToClients(session *Session, msg map[string]interface{}) {
 	data, _ := json.Marshal(msg)
 
@@ -4180,6 +4191,8 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			total += n
+			markSessionInput(s)
+			go broadcastPtyState()
 		}
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "bytes": total, "bracketed_paste": bracketed})
 
@@ -4206,13 +4219,17 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var bytes []byte
+		submitsInput := false
 		switch strings.ToLower(body.Key) {
 		case "enter", "return", "cr":
 			bytes = []byte("\r")
+			submitsInput = true
 		case "lf", "newline":
 			bytes = []byte("\n")
+			submitsInput = true
 		case "crlf":
 			bytes = []byte("\r\n")
+			submitsInput = true
 		case "tab":
 			bytes = []byte("\t")
 		case "escape", "esc":
@@ -4256,6 +4273,10 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		if _, err := s.Pty.Write(bytes); err != nil {
 			writeError(w, 500, fmt.Sprintf("Write failed: %v", err))
 			return
+		}
+		if submitsInput {
+			markSessionInput(s)
+			go broadcastPtyState()
 		}
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "key": body.Key, "bytes": len(bytes)})
 
@@ -4772,10 +4793,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			input, _ := data["data"].(string)
-			session.mu.Lock()
-			session.LastInputAt = time.Now()
-			session.LastOutputDigest = ""
-			session.mu.Unlock()
+			markSessionInput(session)
 			session.Pty.WriteString(input)
 			go broadcastPtyState()
 

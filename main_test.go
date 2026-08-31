@@ -359,6 +359,21 @@ func TestGetSessionProcessesIncludesNonShellRoot(t *testing.T) {
 	t.Fatalf("expected non-shell session root pid %d in process list, got %#v", pid, processes)
 }
 
+func TestMarkSessionInputDrivesCodexStatus(t *testing.T) {
+	session := &Session{LastOutputDigest: "old frame"}
+	markSessionInput(session)
+
+	if session.LastInputAt.IsZero() {
+		t.Fatal("expected submitted REST/WS input to record an input timestamp")
+	}
+	if session.LastOutputDigest != "" {
+		t.Fatalf("expected old output digest to be cleared, got %q", session.LastOutputDigest)
+	}
+	if got := getCodexHeuristicStatus(session, []ProcessInfo{{Pid: 1, Cmd: "codex", Args: "codex"}}); got != "working" {
+		t.Fatalf("expected freshly submitted input to make codex working, got %q", got)
+	}
+}
+
 func TestGetCodexHeuristicStatusIgnoresRecentOutputWithoutInput(t *testing.T) {
 	session := &Session{}
 	session.LastOutputAt = time.Now().Add(-2 * time.Second)
