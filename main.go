@@ -593,7 +593,25 @@ func runCreateSession(args []string) {
 		shell     bool
 		sessionID string
 		name      string
+		link      string
 	)
+	// --link selects a linked daemon while preserving every existing create
+	// flag. Remove it before flag.Parse so the remote and local command shapes
+	// remain identical.
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--link" {
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Usage: --link requires a daemon link name")
+				os.Exit(2)
+			}
+			link = args[i+1]
+			i++
+			continue
+		}
+		filtered = append(filtered, args[i])
+	}
+	args = filtered
 
 	// Find -cmd position to split args
 	cmdIdx := -1
@@ -648,7 +666,7 @@ func runCreateSession(args []string) {
 	}
 
 	jsonBody, _ := json.Marshal(body)
-	data, err := cliRequest("POST", "/api/pty", jsonBody)
+	data, err := sessionAPIRequest(link, "POST", "/api/pty", jsonBody)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -720,6 +738,31 @@ func resolveClientPtyTarget(target string) (string, error) {
 	return resolveClientSessionTarget(data, target)
 }
 
+// A slash is unambiguous because neither link names nor session names may
+// contain one. Bare targets retain the original local-daemon behaviour.
+func splitLinkedSessionTarget(target string) (link, session string) {
+	link, session, ok := strings.Cut(target, "/")
+	if !ok {
+		return "", target
+	}
+	return link, session
+}
+
+func sessionAPIRequest(link, method, path string, body []byte) ([]byte, error) {
+	if link == "" {
+		return cliRequest(method, path, body)
+	}
+	return linkedSessionRequest(link, method, path, body)
+}
+
+func resolveClientPtyTargetOn(link, target string) (string, error) {
+	data, err := sessionAPIRequest(link, http.MethodGet, "/api/pty", nil)
+	if err != nil {
+		return "", err
+	}
+	return resolveClientSessionTarget(data, target)
+}
+
 // runKillSession kills one session by exact ID or unique live name.
 func runKillSession(target string) {
 	id, err := resolveClientPtyTarget(target)
@@ -743,18 +786,20 @@ Authenticates via $AB_PTY_SESSION_TOKEN (injected by the daemon into every
 session). Target defaults to http://127.0.0.1:${AB_PTY_PORT:-8421}.
 
 Usage:
-  ab sessions list [--table|-t]                       # default JSON; --table = human-scan format
-  ab sessions get    <pty_id|name>
-  ab sessions create --shell|--claude [--cwd PATH] [--name NAME] [--rows N] [--cols N]
-  ab sessions kill   <pty_id|name>
-  ab sessions send   <pty_id|name> "text"             # write + auto-submit (appends Enter)
-  ab sessions write  <pty_id|name> "text"             # write only, DO NOT submit — user confirms
-  ab sessions key    <pty_id|name> <key>              # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
-  ab sessions tail   <pty_id|name> [--lines N]        # alias: peek
-  ab sessions rename <pty_id|name> <new-name>
-  ab sessions meta   <pty_id|name> [--set k=v ...]
-  ab sessions lock   <pty_id|name>
-  ab sessions unlock <pty_id|name>
+  ab sessions list [link] [--table|-t]                # omit link for local sessions
+  ab sessions get    [link/]<pty_id|name>
+  ab sessions create [--link LINK] -project PATH [-shell] [-name NAME] [-cmd ...]
+  ab sessions kill   [link/]<pty_id|name>
+  ab sessions send   [link/]<pty_id|name> "text"       # write + auto-submit (appends Enter)
+  ab sessions write  [link/]<pty_id|name> "text"       # write only, DO NOT submit — user confirms
+  ab sessions key    [link/]<pty_id|name> <key>        # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
+  ab sessions tail   [link/]<pty_id|name> [--lines N]  # alias: peek
+  ab sessions rename [link/]<pty_id|name> <new-name>
+  ab sessions meta   [link/]<pty_id|name> [--set k=v ...]
+  ab sessions lock   [link/]<pty_id|name>
+  ab sessions unlock [link/]<pty_id|name>
+
+  ab links list                                        # linked daemons visible from this daemon
 
   ab notes list
   ab notes get    <id>
@@ -773,6 +818,7 @@ Either command accepts explicit --enter / --no-enter to override the default.
 Examples (inside a PTY session, with $AB_PTY_SESSION_TOKEN preset):
   ab sessions list
   ab sessions send  pty_123 "please write the login form"   # auto-submit
+  ab sessions send  bytepiper/back "please check the API"   # same operation through a daemon link
   ab sessions write pty_123 "/refactor-component Button"    # draft; user edits & presses Enter
   ab sessions key   pty_123 enter                           # explicit Enter keypress
   ab sessions tail  pty_123 --lines 40
@@ -795,6 +841,14 @@ func runClient(args []string) {
 		runClientSessions(args[1:])
 	case "notes":
 		runClientNotes(args[1:])
+	case "links":
+		if len(args) != 2 || args[1] != "list" {
+			fmt.Fprintln(os.Stderr, "usage: ab links list")
+			os.Exit(2)
+		}
+		out, err := cliRequest(http.MethodGet, "/api/links", nil)
+		requireOK(err)
+		fmt.Println(string(out))
 	case "add", "list", "role", "revoke":
 		// mTLS client allow-list. `ab-pty client add|list|role|revoke` is the
 		// documented spelling (it reads as "manage clients"); it shares the
@@ -1056,14 +1110,27 @@ func runClientSessions(args []string) {
 	}
 	sub := args[0]
 	rest := args[1:]
-	resolve := func(target string) string {
-		id, err := resolveClientPtyTarget(target)
+	resolve := func(target string) (string, string) {
+		link, session := splitLinkedSessionTarget(target)
+		if strings.TrimSpace(session) == "" {
+			requireOK(fmt.Errorf("a session target is required after %q", link+"/"))
+		}
+		id, err := resolveClientPtyTargetOn(link, session)
 		requireOK(err)
-		return id
+		return link, id
 	}
 	switch sub {
 	case "list":
-		out, err := cliRequest("GET", "/api/pty", nil)
+		link := ""
+		for _, a := range rest {
+			if !strings.HasPrefix(a, "-") {
+				if link != "" {
+					requireOK(fmt.Errorf("sessions list accepts at most one link name"))
+				}
+				link = a
+			}
+		}
+		out, err := sessionAPIRequest(link, "GET", "/api/pty", nil)
 		requireOK(err)
 		// Default output stays JSON so existing agent pipelines (`jq
 		// '.[] | select(.name=="…")'`) keep working. `--table` gives a
@@ -1084,9 +1151,9 @@ func runClientSessions(args []string) {
 			fmt.Println(string(out))
 		}
 	case "get":
-		requireArg(rest, 0, "get", "<pty_id|name>")
-		id := resolve(rest[0])
-		out, err := cliRequest("GET", "/api/pty/"+url.PathEscape(id), nil)
+		requireArg(rest, 0, "get", "[link/]<pty_id|name>")
+		link, id := resolve(rest[0])
+		out, err := sessionAPIRequest(link, "GET", "/api/pty/"+url.PathEscape(id), nil)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "create":
@@ -1095,14 +1162,14 @@ func runClientSessions(args []string) {
 		// top-level `create` command. Easier: just reuse runCreateSession.
 		runCreateSession(rest)
 	case "kill":
-		requireArg(rest, 0, "kill", "<pty_id|name>")
-		id := resolve(rest[0])
-		_, err := cliRequest("DELETE", "/api/pty/"+url.PathEscape(id), nil)
+		requireArg(rest, 0, "kill", "[link/]<pty_id|name>")
+		link, id := resolve(rest[0])
+		_, err := sessionAPIRequest(link, "DELETE", "/api/pty/"+url.PathEscape(id), nil)
 		requireOK(err)
 		fmt.Println(`{"ok":true}`)
 	case "write", "send":
-		requireArg(rest, 1, sub, "<pty_id|name> <text>")
-		target := resolve(rest[0])
+		requireArg(rest, 1, sub, "[link/]<pty_id|name> <text>")
+		link, target := resolve(rest[0])
 		text := rest[1]
 		// Different defaults:
 		//   send  — auto-submit (append Enter). Use "fire-off task" semantics.
@@ -1119,12 +1186,12 @@ func runClientSessions(args []string) {
 			}
 		}
 		body, _ := json.Marshal(map[string]interface{}{"text": text, "enter": enter})
-		out, err := cliRequest("POST", "/api/pty/"+url.PathEscape(target)+"/stdin", body)
+		out, err := sessionAPIRequest(link, "POST", "/api/pty/"+url.PathEscape(target)+"/stdin", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "tail", "peek":
-		requireArg(rest, 0, sub, "<pty_id|name> [--lines N]")
-		target := resolve(rest[0])
+		requireArg(rest, 0, sub, "[link/]<pty_id|name> [--lines N]")
+		link, target := resolve(rest[0])
 		lines := 50
 		for i := 1; i < len(rest); i++ {
 			if rest[i] == "--lines" && i+1 < len(rest) {
@@ -1134,14 +1201,14 @@ func runClientSessions(args []string) {
 				i++
 			}
 		}
-		out, err := cliRequest("GET", fmt.Sprintf("/api/pty/%s/scrollback?lines=%d", url.PathEscape(target), lines), nil)
+		out, err := sessionAPIRequest(link, "GET", fmt.Sprintf("/api/pty/%s/scrollback?lines=%d", url.PathEscape(target), lines), nil)
 		requireOK(err)
 		// Pretty-print lines one per row if the caller asked for --raw? v1: just
 		// print the JSON so it stays machine-parseable.
 		fmt.Println(string(out))
 	case "meta":
-		requireArg(rest, 0, "meta", "<pty_id|name> [--set k=v ...]")
-		target := resolve(rest[0])
+		requireArg(rest, 0, "meta", "[link/]<pty_id|name> [--set k=v ...]")
+		link, target := resolve(rest[0])
 		payload := map[string]interface{}{}
 		metaSet := map[string]interface{}{}
 		for i := 1; i < len(rest); i++ {
@@ -1160,34 +1227,34 @@ func runClientSessions(args []string) {
 			payload["meta"] = metaSet
 		}
 		body, _ := json.Marshal(payload)
-		out, err := cliRequest("PATCH", "/api/pty/"+url.PathEscape(target)+"/meta", body)
+		out, err := sessionAPIRequest(link, "PATCH", "/api/pty/"+url.PathEscape(target)+"/meta", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "rename":
-		requireArg(rest, 1, "rename", "<pty_id|name> <new-name>")
-		id := resolve(rest[0])
+		requireArg(rest, 1, "rename", "[link/]<pty_id|name> <new-name>")
+		link, id := resolve(rest[0])
 		body, _ := json.Marshal(map[string]string{"name": rest[1]})
-		out, err := cliRequest("PATCH", "/api/pty/"+url.PathEscape(id)+"/name", body)
+		out, err := sessionAPIRequest(link, "PATCH", "/api/pty/"+url.PathEscape(id)+"/name", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "key":
-		requireArg(rest, 1, "key", "<pty_id|name> <key>  (enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|...)")
-		target := resolve(rest[0])
+		requireArg(rest, 1, "key", "[link/]<pty_id|name> <key>  (enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|...)")
+		link, target := resolve(rest[0])
 		keyName := rest[1]
 		body, _ := json.Marshal(map[string]interface{}{"key": keyName})
-		out, err := cliRequest("POST", "/api/pty/"+url.PathEscape(target)+"/key", body)
+		out, err := sessionAPIRequest(link, "POST", "/api/pty/"+url.PathEscape(target)+"/key", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "lock":
-		requireArg(rest, 0, "lock", "<pty_id|name>")
-		id := resolve(rest[0])
-		out, err := cliRequest("POST", "/api/pty/"+url.PathEscape(id)+"/lock", nil)
+		requireArg(rest, 0, "lock", "[link/]<pty_id|name>")
+		link, id := resolve(rest[0])
+		out, err := sessionAPIRequest(link, "POST", "/api/pty/"+url.PathEscape(id)+"/lock", nil)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "unlock":
-		requireArg(rest, 0, "unlock", "<pty_id|name>")
-		id := resolve(rest[0])
-		out, err := cliRequest("DELETE", "/api/pty/"+url.PathEscape(id)+"/lock", nil)
+		requireArg(rest, 0, "unlock", "[link/]<pty_id|name>")
+		link, id := resolve(rest[0])
+		out, err := sessionAPIRequest(link, "DELETE", "/api/pty/"+url.PathEscape(id)+"/lock", nil)
 		requireOK(err)
 		fmt.Println(string(out))
 	default:
@@ -1297,6 +1364,14 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/api/tls/clients", requireDaemonAccess(accessAdmin, handleTLSClients))
 	mux.HandleFunc("/api/tls/clients/", requireDaemonAccess(accessAdmin, handleTLSClients))
 
+	// Link discovery is readable like the PTY list; creating/removing links
+	// changes the daemon allow-list and therefore remains admin-only.
+	mux.HandleFunc("/api/links", handleDaemonLinksAdmin)
+	mux.HandleFunc("/api/links/", handleDaemonLinksAdmin)
+	// Only a lifecycle-bound local PTY session may ask its daemon to cross a
+	// link. A certificate-authenticated peer can never cause another hop.
+	mux.HandleFunc("/api/link-proxy/", requireDaemonAccess(accessOperate, handleDaemonLinkProxy))
+
 	// Hook endpoint — called by Claude Code hooks running inside our own
 	// PTY sessions, so it carries no credential. requireLoopback keeps it off the
 	// network: the daemon binds 0.0.0.0 and the handler mutates the
@@ -1307,6 +1382,14 @@ func buildMux() *http.ServeMux {
 }
 
 func main() {
+	// Installations may expose this same binary as `ab` for the in-session
+	// client. Keeping the wrapper as a symlink makes it impossible for the
+	// daemon and agent CLI versions to drift apart.
+	if filepath.Base(os.Args[0]) == "ab" {
+		runClient(os.Args[1:])
+		return
+	}
+
 	// Handle subcommands
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -1781,7 +1864,15 @@ func initDB() {
 	}
 
 	var err error
-	db, err = sql.Open("sqlite3", dbPath)
+	// Relay liveness updates and operator mutations legitimately overlap. Give
+	// SQLite a bounded wait instead of surfacing a transient "database is
+	// locked" to Link/ACL/UI callers, and use WAL so readers do not block the
+	// short write transactions.
+	dsnSeparator := "?"
+	if strings.Contains(dbPath, "?") {
+		dsnSeparator = "&"
+	}
+	db, err = sql.Open("sqlite3", dbPath+dsnSeparator+"_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1873,6 +1964,10 @@ func initDB() {
 	// Relay configuration (see relayclient.go). Same reasoning: created
 	// unconditionally so `ab-pty relay status` answers everywhere.
 	initRelayTable()
+
+	// Explicit daemon-to-daemon links. A peer fingerprint is the identity;
+	// its relay is only the selected route to that identity.
+	initDaemonLinksTable()
 }
 
 type BoardItemRecord struct {
