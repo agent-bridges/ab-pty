@@ -11,13 +11,17 @@ You are running inside an AB PTY session. A local CLI `ab` is available on
 PATH and authenticated automatically via `$AB_PTY_SESSION_TOKEN` (injected
 into this session's env by the PTY daemon). No auth flags needed.
 
-Use `ab` to orchestrate sibling sessions on THIS host.
+Use `ab` to operate sessions on this daemon and on explicitly linked daemons.
+There is no team, mailbox, or automatic routing layer in the transport: a
+remote target is named explicitly as `<link>/<session>`.
 
 ## Quick menu (present this to the user)
 
 - **list sessions** — show all peer sessions
+- **list links** — show the daemon links available from this daemon
+- **list sessions on <link>** — show sessions on one linked daemon
 - **create session <name>** — spawn a new session named `<name>`
-- **send to <name>: <message>** — fire a message at the peer and auto-submit it (this is the default for "send", "tell", "ask", "forward", "message", and any other verb that means the peer should ACT on the text)
+- **send to <name> or <link>/<name>: <message>** — fire a message at the local or linked peer and auto-submit it (this is the default for "send", "tell", "ask", "forward", "message", and any other verb that means the peer should ACT on the text)
 - **write draft to <name>: <message>** — (rare) prefill the peer's input without submitting. Use ONLY when the user explicitly says "draft", "prefill", "prepare without sending", "don't press enter yet", or similar.
 - **key <name> <key>** — press a key in peer (enter, ctrl-c, tab, arrows, …)
 - **tail <name>** — read recent output from peer
@@ -27,17 +31,18 @@ Use `ab` to orchestrate sibling sessions on THIS host.
 
 ## Subcommands
 
-- `ab sessions list` — JSON array of all sessions on this daemon.
-- `ab sessions get <pty_id|name>` — JSON details for one session.
-- `ab sessions create -shell -project <cwd> -name <name>` — create a shell session.
-- `ab sessions send  <pty_id|name> "<text>"` — write text AND press Enter. Auto-submits. Use when the user wants the peer agent to act on the text IMMEDIATELY ("tell dev1 to …", "ask dev2 for …"). Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
-- `ab sessions write <pty_id|name> "<text>"` — write text ONLY, no Enter. The peer's input box is pre-filled; a human (or another explicit call) decides when to submit / edit the text. Use when the user wants to "draft" or "prefill" a message ("prepare a task for dev1 but let me review before sending").
-- `ab sessions key <pty_id|name> <key>` — send an explicit key press. Supported: `enter`, `tab`, `esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `ctrl-c`, `ctrl-d`, `ctrl-z`, `ctrl-l`, `ctrl-u`, `ctrl-w`. Use to interrupt a running command (`ctrl-c`), navigate a TUI menu (arrows + `enter`), or submit a previously-drafted `write` (`enter`).
-- `ab sessions tail  <pty_id|name> --lines 50` — read recent scrollback as JSON.
-- `ab sessions kill  <pty_id|name>` — terminate a session.
-- `ab sessions rename <pty_id|name> <new-name>` — change the sole mutable/displayed session name.
-- `ab sessions meta <pty_id|name> [--set k=v ...]` — update non-identity metadata.
-- `ab sessions lock <pty_id|name>` / `ab sessions unlock <pty_id|name>`.
+- `ab links list` — JSON array of explicit one-hop daemon links.
+- `ab sessions list [link]` — JSON array of local sessions, or sessions on `link` when supplied.
+- `ab sessions get [link/]<pty_id|name>` — JSON details for one local or linked session.
+- `ab sessions create [--link link] -shell -project <cwd> -name <name>` — create a local or linked shell session.
+- `ab sessions send  [link/]<pty_id|name> "<text>"` — write text AND press Enter. Auto-submits. Use when the user wants the peer agent to act on the text IMMEDIATELY ("tell dev1 to …", "ask dev2 for …"). Works for both raw-mode TUIs (Claude Code, Codex) and cooked shells.
+- `ab sessions write [link/]<pty_id|name> "<text>"` — write text ONLY, no Enter. The peer's input box is pre-filled; a human (or another explicit call) decides when to submit / edit the text. Use when the user wants to "draft" or "prefill" a message ("prepare a task for dev1 but let me review before sending").
+- `ab sessions key [link/]<pty_id|name> <key>` — send an explicit key press. Supported: `enter`, `tab`, `esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `ctrl-c`, `ctrl-d`, `ctrl-z`, `ctrl-l`, `ctrl-u`, `ctrl-w`. Use to interrupt a running command (`ctrl-c`), navigate a TUI menu (arrows + `enter`), or submit a previously-drafted `write` (`enter`).
+- `ab sessions tail [link/]<pty_id|name> --lines 50` — read recent scrollback as JSON.
+- `ab sessions kill [link/]<pty_id|name>` — terminate a session.
+- `ab sessions rename [link/]<pty_id|name> <new-name>` — change the sole mutable/displayed session name.
+- `ab sessions meta [link/]<pty_id|name> [--set k=v ...]` — update non-identity metadata.
+- `ab sessions lock [link/]<pty_id|name>` / `ab sessions unlock [link/]<pty_id|name>`.
 
 ## Session identity
 
@@ -52,9 +57,11 @@ from cwd, project basename, board state, or metadata after creation.
 
 ## Resolving names → pty_id
 
-The CLI accepts an exact PTY ID or a unique live session name. It lists sessions,
-lets an exact ID win, otherwise requires exactly one live matching name, and
-then sends the daemon an ID-routed request. Missing or ambiguous names fail.
+The CLI accepts an exact PTY ID or a unique live session name. For a linked
+daemon prefix the target with its explicit link name: `<link>/<session>`. The
+CLI lists sessions on the selected daemon, lets an exact ID win, otherwise
+requires exactly one live matching name, and then sends an ID-routed request.
+Missing or ambiguous links or names fail; there is no route fallback.
 For direct HTTP calls, resolve the name first:
 
 ```
@@ -70,7 +77,10 @@ If `jq` isn't available, grep the JSON and extract the `id` field.
 | "create ab session test"                   | `ab sessions create -shell -project /tmp -name test`                                            |
 | "create sessions s1, s2, s3"               | loop each name with `sessions create ... -name <name>`                                           |
 | "list sessions"                            | `ab sessions list`                                                                     |
+| "list links"                               | `ab links list`                                                                        |
+| "list sessions on box2"                    | `ab sessions list box2`                                                                |
 | "send to dev1: …"                          | resolve dev1 → `ab sessions send  <id> "..."`                                   |
+| "send to box2/dev1: …"                     | `ab sessions send box2/dev1 "..."`                                              |
 | "write to dev1: …" / "message dev1 …"      | resolve dev1 → `ab sessions send  <id> "..."`  ← still send (auto-submit)        |
 | "tell dev1 to …"                           | resolve dev1 → `ab sessions send  <id> "..."`                                   |
 | "ask dev1 what …"                          | resolve dev1 → `ab sessions send  <id> "..."`                                   |
@@ -89,10 +99,20 @@ The user's intent matters:
 
 Default to **send** if unsure — it matches the natural reading of "send to X" and "tell X".
 
+## Linked-daemon behaviour
+
+- `ab links list` is the source of truth for the link names usable in targets.
+- A linked target is always explicit: `ab sessions send box2/dev1 "..."`.
+- Every linked operation is exactly one hop through the relay selected when
+  the daemon link was created. Links never chain, and a peer request cannot
+  proxy through a second link, so agent-to-agent messages cannot form loops.
+- Do not guess a link or silently retry through another relay. If the requested
+  peer is not linked, report that and ask the operator to create the link in UI.
+- Agents may message linked agents directly when the user or the assigned task
+  asks them to coordinate; no team object is required.
+
 ## Notes
 
-- `ab` only reaches sessions on the SAME PTY daemon as yours (v1). To send to
-  a session on a different host, ask the user to configure cross-daemon peering.
 - `ab sessions write` does not append Enter; `ab sessions send` does.
 - The loopback-only session token is bound to YOUR session and this daemon
   process. Ending the session or restarting the daemon invalidates it.
@@ -236,7 +256,10 @@ Tasks arrive as plain text starting with `[TASK <id>]`. Acknowledge with STARTED
 
 ## Cross-role coordination
 
-Don't message peers directly. Send a `QUESTION` to teamlead and let teamlead route it. Same rule regardless of which CLI agent each peer is running.
+Workers may message a peer directly with `ab sessions send <session> "..."` or,
+when it lives on a linked daemon, `ab sessions send <link>/<session> "..."`.
+Keep teamlead informed about decisions, questions and completion through the
+status format above; direct transport does not replace the task roster.
 
 ## Working agreements
 
