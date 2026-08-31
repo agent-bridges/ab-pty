@@ -348,6 +348,17 @@ func TestGetCodexHeuristicStatusWorkingOnRecentActivity(t *testing.T) {
 	}
 }
 
+func TestGetSessionProcessesIncludesNonShellRoot(t *testing.T) {
+	pid := os.Getpid()
+	processes := getSessionProcesses(pid)
+	for _, process := range processes {
+		if process.Pid == pid {
+			return
+		}
+	}
+	t.Fatalf("expected non-shell session root pid %d in process list, got %#v", pid, processes)
+}
+
 func TestGetCodexHeuristicStatusIgnoresRecentOutputWithoutInput(t *testing.T) {
 	session := &Session{}
 	session.LastOutputAt = time.Now().Add(-2 * time.Second)

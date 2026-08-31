@@ -195,11 +195,35 @@ var shellNames = map[string]bool{
 	"bash": true, "sh": true, "zsh": true, "fish": true, "dash": true, "ash": true,
 }
 
-// getChildProcesses recursively collects non-shell child processes of a given PID
-func getChildProcesses(pid int) []ProcessInfo {
+// getSessionProcesses collects every non-shell process that belongs to a PTY
+// session, including the session's root process itself. The root matters for
+// restored/custom-command sessions: those are launched directly as `codex`
+// or `claude`, without an intermediate shell, so looking only below the root
+// makes a live agent disappear from /ws/pty-state entirely.
+func getSessionProcesses(pid int) []ProcessInfo {
 	var result []ProcessInfo
+	if process, ok := readProcessInfo(pid); ok && !shellNames[process.Cmd] {
+		result = append(result, process)
+	}
 	collectChildren(pid, &result, 0)
 	return result
+}
+
+// readProcessInfo turns one /proc cmdline into the public process shape. It is
+// shared by the root and descendant paths so direct and shell-launched agents
+// are classified by exactly the same rules.
+func readProcessInfo(pid int) (ProcessInfo, bool) {
+	cmdlineData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ProcessInfo{}, false
+	}
+	args := strings.TrimSpace(strings.ReplaceAll(string(cmdlineData), "\x00", " "))
+	if args == "" {
+		return ProcessInfo{}, false
+	}
+	parts := strings.SplitN(args, " ", 2)
+	cmd := resolveKnownCmd(filepath.Base(parts[0]), pid, parts[0])
+	return ProcessInfo{Pid: pid, Cmd: cmd, Args: args}, true
 }
 
 // knownPathPatterns maps path substrings to friendly command names.
@@ -269,31 +293,12 @@ func collectChildren(pid int, result *[]ProcessInfo, depth int) {
 		if err != nil {
 			continue
 		}
-		// Read cmdline
-		cmdlineData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", childPid))
-		if err != nil {
+		process, ok := readProcessInfo(childPid)
+		if !ok {
 			continue
 		}
-		// cmdline is NUL-separated
-		args := strings.ReplaceAll(string(cmdlineData), "\x00", " ")
-		args = strings.TrimSpace(args)
-		if args == "" {
-			continue
-		}
-		// Extract command basename
-		parts := strings.SplitN(args, " ", 2)
-		cmd := filepath.Base(parts[0])
-
-		// Claude binary is a symlink like /root/.local/share/claude/versions/2.1.69
-		// so filepath.Base gives "2.1.69" — detect via exe symlink or path patterns
-		cmd = resolveKnownCmd(cmd, childPid, parts[0])
-
-		if !shellNames[cmd] {
-			*result = append(*result, ProcessInfo{
-				Pid:  childPid,
-				Cmd:  cmd,
-				Args: args,
-			})
+		if !shellNames[process.Cmd] {
+			*result = append(*result, process)
 		}
 		// Recurse into children of this child
 		collectChildren(childPid, result, depth+1)
@@ -2512,7 +2517,7 @@ func trackAICmd(session *Session) {
 			continue
 		}
 
-		procs := getChildProcesses(session.Cmd.Process.Pid)
+		procs := getSessionProcesses(session.Cmd.Process.Pid)
 		aiCmd := ""
 		for _, p := range procs {
 			switch p.Cmd {
@@ -2963,7 +2968,7 @@ func broadcastPtyState() {
 		// Collect child processes if session is alive
 		var processes []ProcessInfo
 		if s.IsAlive() && s.Cmd != nil && s.Cmd.Process != nil {
-			processes = getChildProcesses(s.Cmd.Process.Pid)
+			processes = getSessionProcesses(s.Cmd.Process.Pid)
 		}
 		if processes == nil {
 			processes = []ProcessInfo{}
@@ -5933,7 +5938,7 @@ func findPtyByClaudeProcess(claudeSessionID string) string {
 			continue
 		}
 		pid := s.Cmd.Process.Pid
-		procs := getChildProcesses(pid)
+		procs := getSessionProcesses(pid)
 		for _, p := range procs {
 			if p.Cmd == "claude" || p.Cmd == "codex" || p.Cmd == "aider" {
 				aiCount++
