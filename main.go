@@ -2433,7 +2433,7 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	// For claude sessions: inherit daemon env (needs PATH to find claude binary).
 	var cmd *exec.Cmd
 	originalCustomCmd := append([]string(nil), customCmd...)
-	customCmd = preferCodexResumeLast(customCmd)
+	customCmd = preferCodexResumeLast(customCmd, projectPath)
 	if len(customCmd) > 0 {
 		cmd = exec.Command(customCmd[0], customCmd[1:]...)
 		cmd.Env = nil // inherit nothing — let login shell build env

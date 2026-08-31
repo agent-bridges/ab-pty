@@ -34,13 +34,14 @@ func TestShouldUseCodexAppServer(t *testing.T) {
 }
 
 func TestPreferCodexResumeLast(t *testing.T) {
+	projectPath := "/srv/projects/payments"
 	tests := []struct {
 		name string
 		cmd  []string
 		want []string
 	}{
-		{name: "bare codex", cmd: []string{"codex"}, want: []string{"codex", "resume", "--last"}},
-		{name: "absolute codex", cmd: []string{"/usr/local/bin/codex"}, want: []string{"/usr/local/bin/codex", "resume", "--last"}},
+		{name: "bare codex", cmd: []string{"codex"}, want: []string{"codex", "-C", projectPath, "resume", "--last"}},
+		{name: "absolute codex", cmd: []string{"/usr/local/bin/codex"}, want: []string{"/usr/local/bin/codex", "-C", projectPath, "resume", "--last"}},
 		{name: "explicit resume", cmd: []string{"codex", "resume", "thread-id"}, want: []string{"codex", "resume", "thread-id"}},
 		{name: "prompt", cmd: []string{"codex", "fix the tests"}, want: []string{"codex", "fix the tests"}},
 		{name: "other command", cmd: []string{"bash"}, want: []string{"bash"}},
@@ -48,7 +49,7 @@ func TestPreferCodexResumeLast(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := preferCodexResumeLast(test.cmd)
+			got := preferCodexResumeLast(test.cmd, projectPath)
 			if len(got) != len(test.want) {
 				t.Fatalf("preferCodexResumeLast(%q) = %q, want %q", test.cmd, got, test.want)
 			}

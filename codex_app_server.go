@@ -51,15 +51,17 @@ func shouldUseCodexAppServer(customCmd []string) bool {
 }
 
 // preferCodexResumeLast makes app-created bare Codex terminals continue the
-// newest session associated with their working directory. Codex falls back to
-// a fresh session when that directory has no resumable history. Explicit
-// arguments are left alone so callers can still request a new prompted session
-// or a specific Codex subcommand.
-func preferCodexResumeLast(customCmd []string) []string {
+// newest session associated with their working directory. Pass the directory
+// explicitly instead of relying on the process cwd: in remote app-server mode
+// the TUI and server are separate processes, and an interactive login profile
+// may also change cwd before Codex parses `resume --last`. Explicit arguments
+// are left alone so callers can still request a new prompted session or a
+// specific Codex subcommand.
+func preferCodexResumeLast(customCmd []string, projectPath string) []string {
 	if len(customCmd) != 1 || filepath.Base(customCmd[0]) != "codex" {
 		return customCmd
 	}
-	return []string{customCmd[0], "resume", "--last"}
+	return []string{customCmd[0], "-C", projectPath, "resume", "--last"}
 }
 
 func codexRuntimeRoot() string {
