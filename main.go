@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -39,14 +40,84 @@ import (
 	"github.com/creack/pty"
 	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/websocket"
+	"github.com/klauspost/compress/zstd"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sys/unix"
 )
 
 // SafeConn wraps websocket.Conn with a mutex for safe concurrent writes
 type SafeConn struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn        *websocket.Conn
+	mu          sync.Mutex
+	outputCodec string
+	zstdEncoder *zstd.Encoder
+}
+
+const (
+	terminalOutputCodecZstdV1 = "zstd-v1"
+	terminalZstdThreshold     = 1024
+	terminalMaxUncompressed   = 50 << 20
+)
+
+var terminalZstdMagic = [4]byte{'A', 'B', 'Z', '1'}
+
+func (sc *SafeConn) enableOutputCodec(codec string) error {
+	if codec != terminalOutputCodecZstdV1 {
+		return fmt.Errorf("unsupported output_codec %q", codec)
+	}
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(1)))
+	if err != nil {
+		return fmt.Errorf("initialize output codec %q: %w", codec, err)
+	}
+	sc.outputCodec = codec
+	sc.zstdEncoder = encoder
+	return nil
+}
+
+func terminalFrameIsOutput(v interface{}) bool {
+	switch frame := v.(type) {
+	case map[string]interface{}:
+		frameType, _ := frame["type"].(string)
+		return frameType == "output"
+	case map[string]string:
+		return frame["type"] == "output"
+	default:
+		return false
+	}
+}
+
+// writeTerminalFrameLocked preserves the legacy text protocol unless the
+// client explicitly negotiated zstd-v1. Only output frames are eligible for
+// compression; control and metadata frames always remain websocket Text.
+// The caller must hold sc.mu so the reusable encoder is never used
+// concurrently and related replay frames cannot be interleaved.
+func (sc *SafeConn) writeTerminalFrameLocked(data []byte, output bool) error {
+	sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	if !output || sc.outputCodec == "" || len(data) < terminalZstdThreshold {
+		return sc.conn.WriteMessage(websocket.TextMessage, data)
+	}
+	if len(data) > terminalMaxUncompressed {
+		errFrame, _ := json.Marshal(map[string]string{
+			"type":    "error",
+			"message": "terminal output frame exceeds 50 MiB uncompressed limit",
+		})
+		if err := sc.conn.WriteMessage(websocket.TextMessage, errFrame); err != nil {
+			return err
+		}
+		_ = sc.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "terminal output frame exceeds limit"),
+			time.Now().Add(wsWriteWait),
+		)
+		return fmt.Errorf("terminal output frame is %d bytes, limit is %d", len(data), terminalMaxUncompressed)
+	}
+
+	compressed := sc.zstdEncoder.EncodeAll(data, nil)
+	frame := make([]byte, 8+len(compressed))
+	copy(frame[:4], terminalZstdMagic[:])
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(data)))
+	copy(frame[8:], compressed)
+	return sc.conn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
 // WriteMessage writes under a deadline. gorilla/websocket with no write
@@ -63,8 +134,11 @@ func (sc *SafeConn) WriteMessage(messageType int, data []byte) error {
 func (sc *SafeConn) WriteJSON(v interface{}) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	return sc.conn.WriteJSON(v)
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return sc.writeTerminalFrameLocked(data, terminalFrameIsOutput(v))
 }
 
 // WriteJSONBatch serializes a related group of JSON frames against every
@@ -78,8 +152,11 @@ func (sc *SafeConn) WriteJSONBatch(build func() []interface{}) error {
 
 	frames := build()
 	for _, frame := range frames {
-		sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-		if err := sc.conn.WriteJSON(frame); err != nil {
+		data, err := json.Marshal(frame)
+		if err != nil {
+			return err
+		}
+		if err := sc.writeTerminalFrameLocked(data, terminalFrameIsOutput(frame)); err != nil {
 			return err
 		}
 	}
@@ -101,8 +178,7 @@ func (sc *SafeConn) WritePtyOutput(session *Session, seq uint64, data []byte) er
 		return nil
 	}
 
-	sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	return sc.conn.WriteMessage(websocket.TextMessage, data)
+	return sc.writeTerminalFrameLocked(data, true)
 }
 
 // ReadMessage extends the read deadline on every frame that arrives. Any
@@ -118,6 +194,12 @@ func (sc *SafeConn) ReadMessage() (int, []byte, error) {
 }
 
 func (sc *SafeConn) Close() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.zstdEncoder != nil {
+		sc.zstdEncoder.Close()
+		sc.zstdEncoder = nil
+	}
 	return sc.conn.Close()
 }
 
@@ -4933,6 +5015,20 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(msg, &initData); err != nil {
 		return
 	}
+	if rawCodec, present := initData["output_codec"]; present {
+		codec, ok := rawCodec.(string)
+		if !ok {
+			conn.WriteJSON(map[string]string{
+				"type":    "error",
+				"message": "unsupported output_codec: expected a string",
+			})
+			return
+		}
+		if err := conn.enableOutputCodec(codec); err != nil {
+			conn.WriteJSON(map[string]string{"type": "error", "message": err.Error()})
+			return
+		}
+	}
 
 	action, _ := initData["action"].(string)
 	if action == "" {
@@ -5087,6 +5183,26 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		session.mu.Unlock()
 	}()
 
+	sessionsMu.RLock()
+	readyName := session.Name
+	sessionsMu.RUnlock()
+	ready := map[string]interface{}{
+		"type":         "ready",
+		"session_id":   session.ID,
+		"name":         readyName,
+		"project_path": session.ProjectPath,
+	}
+	if conn.outputCodec != "" {
+		ready["output_codec"] = conn.outputCodec
+		// A negotiated client must see the codec confirmation before any output.
+		// It is not registered until after this write, so a live PTY broadcast
+		// cannot race ahead of ready. The replay snapshot itself remains one
+		// conn-locked atomic batch below.
+		if err := conn.WriteJSON(ready); err != nil {
+			return
+		}
+	}
+
 	if immediateScrollback {
 		// Register + snapshot is one conn-first critical section. Once this
 		// client appears in Clients, any live broadcast must wait for conn.mu
@@ -5119,15 +5235,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		session.mu.Unlock()
 	}
 
-	sessionsMu.RLock()
-	readyName := session.Name
-	sessionsMu.RUnlock()
-	conn.WriteJSON(map[string]interface{}{
-		"type":         "ready",
-		"session_id":   session.ID,
-		"name":         readyName,
-		"project_path": session.ProjectPath,
-	})
+	if conn.outputCodec == "" {
+		// Preserve the exact legacy replay -> ready ordering for clients that did
+		// not opt into output compression.
+		if err := conn.WriteJSON(ready); err != nil {
+			return
+		}
+	}
 
 	// Handle client messages
 	for {
