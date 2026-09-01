@@ -67,6 +67,44 @@ func (sc *SafeConn) WriteJSON(v interface{}) error {
 	return sc.conn.WriteJSON(v)
 }
 
+// WriteJSONBatch serializes a related group of JSON frames against every
+// other writer on this websocket. build runs after conn.mu is acquired; the
+// replay path uses that short callback to snapshot Session.Scrollback, then
+// releases session.mu before any network write. Live PTY output therefore
+// lands either before the batch or after it, never between clear/output/info.
+func (sc *SafeConn) WriteJSONBatch(build func() []interface{}) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	frames := build()
+	for _, frame := range frames {
+		sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+		if err := sc.conn.WriteJSON(frame); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WritePtyOutput performs the replay-watermark check while holding conn.mu.
+// A broadcast may have copied this client before a concurrent replay marked
+// the same chunk as already returned; checking only before taking conn.mu
+// would therefore still deliver a duplicate after the replay batch.
+func (sc *SafeConn) WritePtyOutput(session *Session, seq uint64, data []byte) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	session.mu.RLock()
+	deliver := clientNeedsPtyOutputLocked(session, sc, seq)
+	session.mu.RUnlock()
+	if !deliver {
+		return nil
+	}
+
+	sc.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	return sc.conn.WriteMessage(websocket.TextMessage, data)
+}
+
 // ReadMessage extends the read deadline on every frame that arrives. Any
 // traffic at all — an application-level {"type":"ping"}, terminal input, a
 // pong — proves the peer is there, so a client that never learned about
@@ -98,9 +136,14 @@ type Session struct {
 	Pty              *os.File
 	Cmd              *exec.Cmd
 	Clients          map[*SafeConn]bool
-	Scrollback       []string
-	LastRows         int
-	LastCols         int
+	// OutputSeq increments once per raw PTY chunk. ClientReplayThrough is a
+	// per-websocket watermark: output broadcasts at or below it were already
+	// included in that client's latest replay and must not be delivered again.
+	OutputSeq           uint64
+	ClientReplayThrough map[*SafeConn]uint64
+	Scrollback          []string
+	LastRows            int
+	LastCols            int
 	// BracketedPaste is the foreground app's last known bracketed-paste
 	// mode (CSI ?2004h enables, CSI ?2004l disables). Tracked by
 	// readPtyLoop scanning output. When true, `send`/`write` must wrap
@@ -182,6 +225,147 @@ var (
 var ansiEscapePattern = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\)|[@-Z\\-_])`)
 
 const maxScrollback = 10000
+
+// scrollbackReplayWindow is the number of raw PTY output chunks one terminal
+// websocket may replay. limited=false preserves the legacy wire contract:
+// replay every retained chunk. A limited zero window deliberately disables
+// history replay.
+type scrollbackReplayWindow struct {
+	limit   int
+	limited bool
+}
+
+// scrollbackReplay is one coherent snapshot: payload and counts are selected
+// while holding the same Session lock, so scrollback_info always describes
+// the output frame paired with it.
+type scrollbackReplay struct {
+	data       string
+	total      int
+	returned   int
+	throughSeq uint64
+}
+
+func scrollbackReplayWindowFromInit(initData map[string]interface{}) scrollbackReplayWindow {
+	raw, present := initData["scrollback_limit"]
+	if !present {
+		return scrollbackReplayWindow{}
+	}
+	return boundedScrollbackReplayWindow(raw)
+}
+
+// boundedScrollbackReplayWindow parses the integer used both by attach init
+// and by the on-demand scrollback command. encoding/json represents numbers
+// in map[string]interface{} as float64. Invalid values become a zero window
+// rather than unexpectedly widening access to the full retained history.
+func boundedScrollbackReplayWindow(raw interface{}) scrollbackReplayWindow {
+	n, ok := raw.(float64)
+	if !ok || n != n || n <= 0 {
+		return scrollbackReplayWindow{limited: true}
+	}
+	if n >= maxScrollback {
+		return scrollbackReplayWindow{limit: maxScrollback, limited: true}
+	}
+	limit := int(n)
+	if n != float64(limit) {
+		return scrollbackReplayWindow{limited: true}
+	}
+	return scrollbackReplayWindow{limit: limit, limited: true}
+}
+
+// selectScrollbackTail returns a copy of the selected raw chunks. Copying is
+// intentional: callers can join/use the result after releasing Session.mu.
+func selectScrollbackTail(chunks []string, window scrollbackReplayWindow) []string {
+	if window.limited && window.limit == 0 {
+		return nil
+	}
+	start := 0
+	if window.limited && len(chunks) > window.limit {
+		start = len(chunks) - window.limit
+	}
+	return append([]string(nil), chunks[start:]...)
+}
+
+// sessionScrollbackReplayLocked requires session.mu to be held. Initial
+// attach uses it while atomically registering the client and snapshotting the
+// history under conn.mu, closing the gap where live output could otherwise be
+// broadcast before this websocket became a subscriber.
+func sessionScrollbackReplayLocked(session *Session, window scrollbackReplayWindow) scrollbackReplay {
+	total := len(session.Scrollback)
+	chunks := selectScrollbackTail(session.Scrollback, window)
+	throughSeq := uint64(0)
+	if len(chunks) > 0 {
+		// Every replay window is a suffix, so a non-empty selection always
+		// includes the newest retained chunk.
+		throughSeq = session.OutputSeq
+	}
+	return scrollbackReplay{
+		data:       strings.Join(chunks, ""),
+		total:      total,
+		returned:   len(chunks),
+		throughSeq: throughSeq,
+	}
+}
+
+func markClientReplayLocked(session *Session, conn *SafeConn, replay scrollbackReplay) {
+	// A zero-window replay did not include any live chunk and therefore must
+	// not suppress a broadcast that was already pending for this client.
+	if replay.returned == 0 || replay.throughSeq == 0 {
+		return
+	}
+	if session.ClientReplayThrough == nil {
+		session.ClientReplayThrough = make(map[*SafeConn]uint64)
+	}
+	if replay.throughSeq > session.ClientReplayThrough[conn] {
+		session.ClientReplayThrough[conn] = replay.throughSeq
+	}
+}
+
+// clientNeedsPtyOutputLocked requires session.mu and is intentionally checked
+// only after the caller has acquired conn.mu; see SafeConn.WritePtyOutput.
+func clientNeedsPtyOutputLocked(session *Session, conn *SafeConn, seq uint64) bool {
+	if !session.Clients[conn] {
+		return false
+	}
+	return seq > session.ClientReplayThrough[conn]
+}
+
+func scrollbackReplayFrames(replay scrollbackReplay, clear bool, clearEmpty bool, info bool) []interface{} {
+	frames := make([]interface{}, 0, 3)
+	if clear && (clearEmpty || replay.data != "") {
+		frames = append(frames, map[string]string{"type": "clear"})
+	}
+	if replay.data != "" {
+		frames = append(frames, map[string]interface{}{"type": "output", "data": replay.data})
+	}
+	if info {
+		frames = append(frames, map[string]interface{}{
+			"type":            "scrollback_info",
+			"total_chunks":    replay.total,
+			"returned_chunks": replay.returned,
+		})
+	}
+	return frames
+}
+
+func writeScrollbackReplay(
+	conn *SafeConn,
+	session *Session,
+	window scrollbackReplayWindow,
+	clear bool,
+	clearEmpty bool,
+	info bool,
+) {
+	conn.WriteJSONBatch(func() []interface{} {
+		// Lock order is conn.mu -> session.mu. broadcastToClients copies its
+		// recipients under session.mu and releases it before taking conn.mu,
+		// so there is no inverse held-lock path.
+		session.mu.Lock()
+		replay := sessionScrollbackReplayLocked(session, window)
+		markClientReplayLocked(session, conn, replay)
+		session.mu.Unlock()
+		return scrollbackReplayFrames(replay, clear, clearEmpty, info)
+	})
+}
 
 // ProcessInfo describes a child process running inside a PTY session
 type ProcessInfo struct {
@@ -2514,19 +2698,20 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	}
 
 	session := &Session{
-		ID:          sessionID,
-		Name:        name,
-		ProjectPath: projectPath,
-		LastCwd:     projectPath,
-		CreatedAt:   time.Now(),
-		Alive:       true,
-		ShellOnly:   shellOnly,
-		Pty:         ptmx,
-		Cmd:         cmd,
-		Clients:     make(map[*SafeConn]bool),
-		Scrollback:  make([]string, 0),
-		LastRows:    rows,
-		LastCols:    cols,
+		ID:                  sessionID,
+		Name:                name,
+		ProjectPath:         projectPath,
+		LastCwd:             projectPath,
+		CreatedAt:           time.Now(),
+		Alive:               true,
+		ShellOnly:           shellOnly,
+		Pty:                 ptmx,
+		Cmd:                 cmd,
+		Clients:             make(map[*SafeConn]bool),
+		ClientReplayThrough: make(map[*SafeConn]uint64),
+		Scrollback:          make([]string, 0),
+		LastRows:            rows,
+		LastCols:            cols,
 	}
 
 	// Re-check while holding the insertion lock so concurrent creates cannot
@@ -2804,13 +2989,10 @@ func readPtyLoop(session *Session) {
 			text := string(buf[:n])
 
 			session.mu.Lock()
-			session.Scrollback = append(session.Scrollback, text)
+			seq := appendScrollbackChunkLocked(session, text)
 			if cleaned := extractMeaningfulTerminalOutput(text); cleaned != "" && cleaned != session.LastOutputDigest {
 				session.LastOutputAt = time.Now()
 				session.LastOutputDigest = cleaned
-			}
-			if len(session.Scrollback) > maxScrollback {
-				session.Scrollback = session.Scrollback[len(session.Scrollback)-maxScrollback:]
 			}
 			// Track bracketed-paste mode toggles from the foreground app.
 			// Whichever marker appears LATER in this chunk wins; if only
@@ -2825,7 +3007,7 @@ func readPtyLoop(session *Session) {
 			}
 			session.mu.Unlock()
 
-			broadcastToClients(session, map[string]interface{}{
+			broadcastPtyOutput(session, seq, map[string]interface{}{
 				"type": "output",
 				"data": text,
 			})
@@ -2837,6 +3019,18 @@ func readPtyLoop(session *Session) {
 	deactivateSession(session.ID)
 	broadcastToClients(session, map[string]interface{}{"type": "session_ended"})
 	broadcastPtyState()
+}
+
+// appendScrollbackChunkLocked records one raw PTY read and returns its
+// monotonically increasing broadcast sequence. It requires session.mu.
+func appendScrollbackChunkLocked(session *Session, text string) uint64 {
+	session.OutputSeq++
+	seq := session.OutputSeq
+	session.Scrollback = append(session.Scrollback, text)
+	if len(session.Scrollback) > maxScrollback {
+		session.Scrollback = session.Scrollback[len(session.Scrollback)-maxScrollback:]
+	}
+	return seq
 }
 
 // markSessionInput is the one definition of "the user just submitted work"
@@ -2864,6 +3058,24 @@ func broadcastToClients(session *Session, msg map[string]interface{}) {
 	// Write to each client (SafeConn handles its own locking)
 	for _, c := range clients {
 		c.WriteMessage(websocket.TextMessage, data)
+	}
+}
+
+// broadcastPtyOutput is the only sequence-aware broadcast. Generic terminal
+// events (session_ended and future control frames) keep broadcastToClients'
+// unchanged delivery semantics.
+func broadcastPtyOutput(session *Session, seq uint64, msg map[string]interface{}) {
+	data, _ := json.Marshal(msg)
+
+	session.mu.RLock()
+	clients := make([]*SafeConn, 0, len(session.Clients))
+	for c := range session.Clients {
+		clients = append(clients, c)
+	}
+	session.mu.RUnlock()
+
+	for _, c := range clients {
+		c.WritePtyOutput(session, seq, data)
 	}
 }
 
@@ -3044,6 +3256,27 @@ func cleanupStaleBoardItems() {
 func setWinsize(f *os.File, rows, cols int) {
 	syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(syscall.TIOCSWINSZ),
 		uintptr(unsafe.Pointer(&struct{ h, w, x, y uint16 }{uint16(rows), uint16(cols), 0, 0})))
+}
+
+// signalForegroundPtyRedraw asks the foreground job, not merely the PTY's
+// root process, to repaint its current screen. Sending to -pgrp reaches the
+// complete Codex/Claude foreground pipeline. It intentionally performs no
+// scrollback replay; fresh VT state must come from the TUI itself.
+func signalForegroundPtyRedraw(f *os.File) error {
+	if f == nil {
+		return fmt.Errorf("PTY is unavailable")
+	}
+	pgrp, err := unix.IoctlGetInt(int(f.Fd()), unix.TIOCGPGRP)
+	if err != nil {
+		return fmt.Errorf("get foreground PTY process group: %w", err)
+	}
+	if pgrp <= 0 {
+		return fmt.Errorf("invalid foreground PTY process group %d", pgrp)
+	}
+	if err := syscall.Kill(-pgrp, syscall.SIGWINCH); err != nil {
+		return fmt.Errorf("signal foreground PTY process group %d: %w", pgrp, err)
+	}
+	return nil
 }
 
 func broadcastPtyState() {
@@ -4688,6 +4921,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	var session *Session
 	var createErr error
 	pendingScrollback := false
+	immediateScrollback := false
 
 	// Read init message
 	_, msg, err := conn.ReadMessage()
@@ -4712,6 +4946,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := int(getFloat(initData, "rows", 40))
 	cols := int(getFloat(initData, "cols", 120))
+	replayWindow := scrollbackReplayWindowFromInit(initData)
 
 	switch action {
 	case "recreate":
@@ -4798,13 +5033,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		session = s
 
-		if reqScroll, ok := initData["request_scrollback"].(bool); ok && reqScroll {
-			session.mu.RLock()
-			scrollback := strings.Join(session.Scrollback, "")
-			session.mu.RUnlock()
-			if scrollback != "" {
-				conn.WriteJSON(map[string]interface{}{"type": "output", "data": scrollback})
-			}
+		// Presence of scrollback_limit opts into the authoritative lazy-replay
+		// protocol. Replay it immediately, even when request_scrollback=false:
+		// new clients intentionally send false so an old daemon cannot dump the
+		// full legacy buffer before they discover protocol incompatibility.
+		// request_scrollback retains its old immediate-vs-first-resize meaning
+		// only when the new field is absent.
+		reqScroll, _ := initData["request_scrollback"].(bool)
+		if replayWindow.limited || reqScroll {
+			immediateScrollback = true
 		} else {
 			pendingScrollback = true
 		}
@@ -4843,16 +5080,44 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register client
-	session.mu.Lock()
-	session.Clients[conn] = true
-	session.mu.Unlock()
-
 	defer func() {
 		session.mu.Lock()
 		delete(session.Clients, conn)
+		delete(session.ClientReplayThrough, conn)
 		session.mu.Unlock()
 	}()
+
+	if immediateScrollback {
+		// Register + snapshot is one conn-first critical section. Once this
+		// client appears in Clients, any live broadcast must wait for conn.mu
+		// and therefore follows the complete initial replay batch.
+		conn.WriteJSONBatch(func() []interface{} {
+			session.mu.Lock()
+			if session.Clients == nil {
+				session.Clients = make(map[*SafeConn]bool)
+			}
+			session.Clients[conn] = true
+			replay := sessionScrollbackReplayLocked(session, replayWindow)
+			markClientReplayLocked(session, conn, replay)
+			session.mu.Unlock()
+			// Metadata belongs to the explicit lazy-replay protocol only.
+			// A legacy request_scrollback client keeps its exact output->ready
+			// frame sequence and never has to understand scrollback_info.
+			return scrollbackReplayFrames(
+				replay,
+				replayWindow.limited,
+				replayWindow.limited,
+				replayWindow.limited,
+			)
+		})
+	} else {
+		session.mu.Lock()
+		if session.Clients == nil {
+			session.Clients = make(map[*SafeConn]bool)
+		}
+		session.Clients[conn] = true
+		session.mu.Unlock()
+	}
 
 	sessionsMu.RLock()
 	readyName := session.Name
@@ -4892,6 +5157,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			session.Pty.WriteString(input)
 			go broadcastPtyState()
 
+		case "scrollback":
+			// On-demand history loading updates this websocket's replay window;
+			// subsequent terminal resizes keep using the same bounded tail.
+			replayWindow = boundedScrollbackReplayWindow(data["limit"])
+			pendingScrollback = false
+			writeScrollbackReplay(conn, session, replayWindow, true, true, true)
+
+		case "redraw":
+			// A fresh VT repaint comes only from the foreground TUI. This
+			// command intentionally ignores geometry and neither consumes nor
+			// emits any replay/pending-scrollback frames.
+			if err := signalForegroundPtyRedraw(session.Pty); err != nil {
+				log.Printf("PTY redraw failed for %s: %v", session.ID, err)
+			}
+
 		case "resize":
 			// Winsize lives on the Session and is written from whichever
 			// websocket goroutine owns this terminal, while readers sit in
@@ -4901,31 +5181,22 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			curRows, curCols := session.Winsize()
 			newRows := int(getFloat(data, "rows", float64(curRows)))
 			newCols := int(getFloat(data, "cols", float64(curCols)))
+			sizeChanged := newRows != curRows || newCols != curCols
 
-			if newRows != curRows || newCols != curCols {
+			if sizeChanged {
 				session.setWinsize(newRows, newCols)
 				setWinsize(session.Pty, newRows, newCols)
+			}
 
+			if sizeChanged {
 				if !pendingScrollback {
-					session.mu.RLock()
-					scrollback := strings.Join(session.Scrollback, "")
-					session.mu.RUnlock()
-					if scrollback != "" {
-						conn.WriteJSON(map[string]string{"type": "clear"})
-						conn.WriteJSON(map[string]interface{}{"type": "output", "data": scrollback})
-					}
+					writeScrollbackReplay(conn, session, replayWindow, true, false, false)
 				}
 			}
 
 			if pendingScrollback {
 				pendingScrollback = false
-				session.mu.RLock()
-				scrollback := strings.Join(session.Scrollback, "")
-				session.mu.RUnlock()
-				if scrollback != "" {
-					conn.WriteJSON(map[string]string{"type": "clear"})
-					conn.WriteJSON(map[string]interface{}{"type": "output", "data": scrollback})
-				}
+				writeScrollbackReplay(conn, session, replayWindow, true, false, false)
 			}
 		}
 	}

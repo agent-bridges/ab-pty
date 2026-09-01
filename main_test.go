@@ -1076,6 +1076,282 @@ func TestWebSocketPtyStateUsesNameOnlyIdentity(t *testing.T) {
 	}
 }
 
+func TestSelectScrollbackTail(t *testing.T) {
+	chunks := []string{"a", "b", "c", "d"}
+
+	legacy := scrollbackReplayWindowFromInit(map[string]interface{}{})
+	if got := strings.Join(selectScrollbackTail(chunks, legacy), ""); got != "abcd" {
+		t.Fatalf("absent limit must preserve legacy all replay, got %q", got)
+	}
+
+	zero := boundedScrollbackReplayWindow(float64(0))
+	if got := selectScrollbackTail(chunks, zero); len(got) != 0 {
+		t.Fatalf("zero limit returned %d chunks, want none", len(got))
+	}
+
+	bounded := boundedScrollbackReplayWindow(float64(2))
+	if got := strings.Join(selectScrollbackTail(chunks, bounded), ""); got != "cd" {
+		t.Fatalf("bounded replay got %q, want tail %q", got, "cd")
+	}
+
+	over := boundedScrollbackReplayWindow(float64(maxScrollback + 500))
+	if !over.limited || over.limit != maxScrollback {
+		t.Fatalf("over-limit window = %+v, want clamp to %d", over, maxScrollback)
+	}
+	large := make([]string, maxScrollback+2)
+	large[2] = "tail-start"
+	selected := selectScrollbackTail(large, over)
+	if len(selected) != maxScrollback || selected[0] != "tail-start" {
+		t.Fatalf("clamped selection len=%d first=%q", len(selected), selected[0])
+	}
+}
+
+func TestReplayWatermarkSkipsDelayedOutputWithoutSuppressingZeroWindow(t *testing.T) {
+	session := &Session{
+		Clients:             make(map[*SafeConn]bool),
+		ClientReplayThrough: make(map[*SafeConn]uint64),
+	}
+	client := &SafeConn{}
+	zeroClient := &SafeConn{}
+
+	// X is appended first, but its broadcast is deliberately delayed until
+	// after the replay snapshot. Since replay includes X, that delayed output
+	// must be suppressed for this client.
+	session.mu.Lock()
+	session.Clients[client] = true
+	seqX := appendScrollbackChunkLocked(session, "X")
+	replay := sessionScrollbackReplayLocked(session, boundedScrollbackReplayWindow(float64(1)))
+	markClientReplayLocked(session, client, replay)
+	delayedXEligible := clientNeedsPtyOutputLocked(session, client, seqX)
+
+	// A chunk appended after the snapshot is live output and must pass.
+	seqY := appendScrollbackChunkLocked(session, "Y")
+	postSnapshotYEligible := clientNeedsPtyOutputLocked(session, client, seqY)
+
+	// A fresh client asking for zero history includes no chunks. Even though Z
+	// already exists when its zero snapshot is taken, the pending live Z
+	// broadcast must not be suppressed.
+	session.Clients[zeroClient] = true
+	seqZ := appendScrollbackChunkLocked(session, "Z")
+	zeroReplay := sessionScrollbackReplayLocked(session, boundedScrollbackReplayWindow(float64(0)))
+	markClientReplayLocked(session, zeroClient, zeroReplay)
+	pendingZEligible := clientNeedsPtyOutputLocked(session, zeroClient, seqZ)
+	session.mu.Unlock()
+
+	if delayedXEligible {
+		t.Fatal("delayed X remained eligible after replay included it")
+	}
+	if !postSnapshotYEligible {
+		t.Fatal("post-snapshot Y was incorrectly suppressed")
+	}
+	if !pendingZEligible {
+		t.Fatal("zero-window replay suppressed pending live Z")
+	}
+}
+
+func TestSignalForegroundPtyRedrawRejectsUnavailableOrNonPtyFile(t *testing.T) {
+	if err := signalForegroundPtyRedraw(nil); err == nil {
+		t.Fatal("nil PTY unexpectedly accepted for redraw")
+	}
+
+	file, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := signalForegroundPtyRedraw(file); err == nil {
+		t.Fatal("non-PTY file unexpectedly produced a foreground process group")
+	}
+}
+
+func TestScrollbackReplayFramesKeepBatchOrder(t *testing.T) {
+	frames := scrollbackReplayFrames(
+		scrollbackReplay{data: "tail", total: 8, returned: 2},
+		true,
+		true,
+		true,
+	)
+	want := []string{"clear", "output", "scrollback_info"}
+	if len(frames) != len(want) {
+		t.Fatalf("got %d frames, want %d", len(frames), len(want))
+	}
+	for i, frame := range frames {
+		payload, ok := frame.(map[string]interface{})
+		if !ok {
+			// clear uses the narrower map type; normalize just its type field.
+			if clear, clearOK := frame.(map[string]string); clearOK && clear["type"] == want[i] {
+				continue
+			}
+			t.Fatalf("frame %d has unexpected payload type %T", i, frame)
+		}
+		if payload["type"] != want[i] {
+			t.Fatalf("frame %d type=%v, want %q", i, payload["type"], want[i])
+		}
+	}
+
+	empty := scrollbackReplayFrames(
+		scrollbackReplay{total: 8},
+		true,
+		true,
+		true,
+	)
+	if len(empty) != 2 {
+		t.Fatalf("zero-window batch has %d frames, want clear + info", len(empty))
+	}
+}
+
+func TestWebSocketScrollbackWindowAndOnDemandReplay(t *testing.T) {
+	ptyFile, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ptyFile.Close()
+
+	session := &Session{
+		ID:          "pty_scrollback_window_test",
+		Name:        "scrollback-window-test",
+		ProjectPath: "/tmp",
+		Alive:       true,
+		Pty:         ptyFile,
+		Clients:     make(map[*SafeConn]bool),
+		Scrollback:  []string{"a", "b", "c", "d"},
+		OutputSeq:   4,
+		LastRows:    24,
+		LastCols:    80,
+	}
+	sessionsMu.Lock()
+	sessions[session.ID] = session
+	sessionsMu.Unlock()
+	t.Cleanup(func() {
+		sessionsMu.Lock()
+		delete(sessions, session.ID)
+		sessionsMu.Unlock()
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(handleWebSocket))
+	defer server.Close()
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	if err := ws.WriteJSON(map[string]interface{}{
+		"action": "attach",
+		"pty_id": session.ID,
+		"rows":   24,
+		"cols":   80,
+		// Explicit limit is authoritative and must replay immediately even
+		// though false preserves safety when talking to an older daemon.
+		"request_scrollback": false,
+		"scrollback_limit":   2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	readFrame := func() map[string]interface{} {
+		t.Helper()
+		var frame map[string]interface{}
+		if err := ws.ReadJSON(&frame); err != nil {
+			t.Fatal(err)
+		}
+		return frame
+	}
+	assertFrame := func(wantType string) map[string]interface{} {
+		t.Helper()
+		frame := readFrame()
+		if frame["type"] != wantType {
+			t.Fatalf("frame type=%v, want %q; frame=%v", frame["type"], wantType, frame)
+		}
+		return frame
+	}
+
+	assertFrame("clear")
+	if frame := assertFrame("output"); frame["data"] != "cd" {
+		t.Fatalf("initial bounded replay=%q, want %q", frame["data"], "cd")
+	}
+	info := assertFrame("scrollback_info")
+	if info["total_chunks"] != float64(4) || info["returned_chunks"] != float64(2) {
+		t.Fatalf("initial scrollback metadata=%v", info)
+	}
+	assertFrame("ready")
+
+	// Redraw is a signal-only command: even when signalling fails for this
+	// fake /dev/null PTY, it must not emit replay or consume another command.
+	if err := ws.WriteJSON(map[string]string{"type": "redraw"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+		t.Fatal(err)
+	}
+	assertFrame("pong")
+
+	if err := ws.WriteJSON(map[string]interface{}{"type": "scrollback", "limit": 3}); err != nil {
+		t.Fatal(err)
+	}
+	assertFrame("clear")
+	if frame := assertFrame("output"); frame["data"] != "bcd" {
+		t.Fatalf("on-demand replay=%q, want %q", frame["data"], "bcd")
+	}
+	info = assertFrame("scrollback_info")
+	if info["total_chunks"] != float64(4) || info["returned_chunks"] != float64(3) {
+		t.Fatalf("on-demand scrollback metadata=%v", info)
+	}
+
+	// Resize must keep the on-demand window (3), not regress to all 4 chunks.
+	if err := ws.WriteJSON(map[string]interface{}{"type": "resize", "rows": 25, "cols": 80}); err != nil {
+		t.Fatal(err)
+	}
+	assertFrame("clear")
+	if frame := assertFrame("output"); frame["data"] != "bcd" {
+		t.Fatalf("resize replay=%q, want current window %q", frame["data"], "bcd")
+	}
+
+	// A zero on-demand window still acknowledges the exact snapshot with
+	// metadata, but emits no output history.
+	if err := ws.WriteJSON(map[string]interface{}{"type": "scrollback", "limit": 0}); err != nil {
+		t.Fatal(err)
+	}
+	assertFrame("clear")
+	info = assertFrame("scrollback_info")
+	if info["total_chunks"] != float64(4) || info["returned_chunks"] != float64(0) {
+		t.Fatalf("zero-window scrollback metadata=%v", info)
+	}
+
+	// Zero replay must not suppress a live chunk that was not returned.
+	session.mu.Lock()
+	seqZ := appendScrollbackChunkLocked(session, "Z")
+	session.mu.Unlock()
+	broadcastPtyOutput(session, seqZ, map[string]interface{}{"type": "output", "data": "Z"})
+	if frame := assertFrame("output"); frame["data"] != "Z" {
+		t.Fatalf("live output after zero replay=%q, want Z", frame["data"])
+	}
+
+	// Deterministic delayed-broadcast case: append X, snapshot it through the
+	// on-demand command, then deliver the old broadcast. The per-client
+	// watermark must suppress that duplicate, so pong is the next frame.
+	session.mu.Lock()
+	seqX := appendScrollbackChunkLocked(session, "X")
+	session.mu.Unlock()
+	if err := ws.WriteJSON(map[string]interface{}{"type": "scrollback", "limit": 1}); err != nil {
+		t.Fatal(err)
+	}
+	assertFrame("clear")
+	if frame := assertFrame("output"); frame["data"] != "X" {
+		t.Fatalf("single-chunk replay=%q, want X", frame["data"])
+	}
+	info = assertFrame("scrollback_info")
+	if info["total_chunks"] != float64(6) || info["returned_chunks"] != float64(1) {
+		t.Fatalf("single-chunk scrollback metadata=%v", info)
+	}
+	broadcastPtyOutput(session, seqX, map[string]interface{}{"type": "output", "data": "X"})
+	if err := ws.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+		t.Fatal(err)
+	}
+	assertFrame("pong")
+}
+
 func TestWebSocketTerminal(t *testing.T) {
 	initTestDB()
 
