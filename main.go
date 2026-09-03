@@ -35,6 +35,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/creack/pty"
@@ -3058,49 +3059,121 @@ func trackClaudeSession(session *Session) {
 }
 
 func readPtyLoop(session *Session) {
-	buf := make([]byte, 8192)
-	for session.IsAlive() {
-		n, err := session.Pty.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("PTY read error: %v", err)
-			}
-			break
-		}
-		if n > 0 {
-			text := string(buf[:n])
-
-			session.mu.Lock()
-			seq := appendScrollbackChunkLocked(session, text)
-			if cleaned := extractMeaningfulTerminalOutput(text); cleaned != "" && cleaned != session.LastOutputDigest {
-				session.LastOutputAt = time.Now()
-				session.LastOutputDigest = cleaned
-			}
-			// Track bracketed-paste mode toggles from the foreground app.
-			// Whichever marker appears LATER in this chunk wins; if only
-			// one appears, that one wins. Used by the stdin handler to
-			// decide whether to wrap pasted payloads in \x1b[200~/\x1b[201~.
-			onIdx := strings.LastIndex(text, "\x1b[?2004h")
-			offIdx := strings.LastIndex(text, "\x1b[?2004l")
-			if onIdx > offIdx {
-				session.BracketedPaste = true
-			} else if offIdx > onIdx {
-				session.BracketedPaste = false
-			}
-			session.mu.Unlock()
-
-			broadcastPtyOutput(session, seq, map[string]interface{}{
-				"type": "output",
-				"data": text,
-			})
-		}
-	}
+	readPtyUTF8Output(session.Pty, session.IsAlive, func(text string) {
+		publishPtyOutput(session, text)
+	})
 
 	session.setAlive(false)
 	stopCodexAppServer(session.ID)
 	deactivateSession(session.ID)
 	broadcastToClients(session, map[string]interface{}{"type": "session_ended"})
 	broadcastPtyState()
+}
+
+func readPtyUTF8Output(reader io.Reader, keepReading func() bool, publish func(string)) {
+	buf := make([]byte, 8192)
+	// PTY reads are arbitrary byte chunks, not character boundaries. Keep an
+	// incomplete UTF-8 rune until the next read instead of handing invalid
+	// string bytes to encoding/json (which would irreversibly turn both halves
+	// of a split Cyrillic/emoji rune into U+FFFD).
+	decoder := terminalUTF8StreamDecoder{}
+	for keepReading() {
+		n, err := reader.Read(buf)
+		// io.Reader is allowed to return useful final bytes together with EOF
+		// (or another error). Consume those bytes before handling the error.
+		if n > 0 {
+			if text := decoder.Push(buf[:n], false); text != "" {
+				publish(text)
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("PTY read error: %v", err)
+			}
+			break
+		}
+	}
+	// A genuinely truncated final rune is malformed input. Emit one stable
+	// replacement character instead of silently dropping those bytes.
+	if text := decoder.Push(nil, true); text != "" {
+		publish(text)
+	}
+}
+
+// terminalUTF8StreamDecoder turns arbitrary PTY byte chunks into valid UTF-8
+// without assuming that read(2) stopped at a rune boundary. Valid split runes
+// are reconstructed. A truly invalid byte produces one deterministic U+FFFD;
+// a truncated sequence produces one U+FFFD when the stream ends.
+//
+// The decoder is deliberately scoped to one readPtyLoop. Websocket clients
+// reconnecting to the same PTY must not reset it: they consume the same live
+// stream and the session's already-decoded scrollback. A recreated PTY starts
+// a new loop and therefore a fresh decoder.
+type terminalUTF8StreamDecoder struct {
+	pending []byte
+}
+
+func (d *terminalUTF8StreamDecoder) Push(chunk []byte, final bool) string {
+	data := chunk
+	if len(d.pending) != 0 {
+		data = make([]byte, 0, len(d.pending)+len(chunk))
+		data = append(data, d.pending...)
+		data = append(data, chunk...)
+		d.pending = nil
+	}
+	if len(data) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	out.Grow(len(data))
+	for len(data) != 0 {
+		if !utf8.FullRune(data) {
+			if final {
+				out.WriteRune(utf8.RuneError)
+			} else {
+				d.pending = append(d.pending[:0], data...)
+			}
+			break
+		}
+		r, size := utf8.DecodeRune(data)
+		if r == utf8.RuneError && size == 1 {
+			out.WriteRune(utf8.RuneError)
+		} else {
+			out.Write(data[:size])
+		}
+		data = data[size:]
+	}
+	return out.String()
+}
+
+func publishPtyOutput(session *Session, text string) {
+	if text == "" {
+		return
+	}
+
+	session.mu.Lock()
+	seq := appendScrollbackChunkLocked(session, text)
+	if cleaned := extractMeaningfulTerminalOutput(text); cleaned != "" && cleaned != session.LastOutputDigest {
+		session.LastOutputAt = time.Now()
+		session.LastOutputDigest = cleaned
+	}
+	// Track bracketed-paste mode toggles from the foreground app. Whichever
+	// marker appears LATER in this decoded chunk wins; if only one appears,
+	// that one wins.
+	onIdx := strings.LastIndex(text, "\x1b[?2004h")
+	offIdx := strings.LastIndex(text, "\x1b[?2004l")
+	if onIdx > offIdx {
+		session.BracketedPaste = true
+	} else if offIdx > onIdx {
+		session.BracketedPaste = false
+	}
+	session.mu.Unlock()
+
+	broadcastPtyOutput(session, seq, map[string]interface{}{
+		"type": "output",
+		"data": text,
+	})
 }
 
 // appendScrollbackChunkLocked records one raw PTY read and returns its
