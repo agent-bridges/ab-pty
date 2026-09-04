@@ -36,7 +36,17 @@ type codexAppServerRuntime struct {
 var (
 	codexRuntimesMu sync.Mutex
 	codexRuntimes   = map[string]*codexAppServerRuntime{}
+
+	// One Codex app-server may own several threads at once (the visible
+	// conversation plus sub-agents). Status notifications are scoped to a
+	// thread, not to the app-server connection. Keep that scope here so a
+	// completed child turn cannot paint the whole PTY idle while another
+	// thread is still working.
+	codexActivityMu sync.Mutex
+	codexActivities = map[string]map[string]bool{}
 )
+
+const anonymousCodexThread = "_anonymous"
 
 func shouldUseCodexAppServer(customCmd []string) bool {
 	if len(customCmd) == 0 || filepath.Base(customCmd[0]) != "codex" {
@@ -174,7 +184,7 @@ func startCodexAppServer(sessionID, projectPath string, env, customCmd []string)
 	codexRuntimes[sessionID] = runtime
 	codexRuntimesMu.Unlock()
 
-	setAiStatusAuthoritative(sessionID, "idle", "")
+	resetCodexActivity(sessionID)
 	go runtime.acceptLoop()
 	go func() {
 		err := <-serverExited
@@ -335,25 +345,27 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 	switch message.Method {
 	case "thread/status/changed":
 		var params struct {
-			Status codexThreadStatus `json:"status"`
+			ThreadID string            `json:"threadId"`
+			Status   codexThreadStatus `json:"status"`
 		}
 		if json.Unmarshal(message.Params, &params) != nil {
 			return
 		}
-		applyCodexThreadStatus(sessionID, params.Status)
+		applyCodexThreadStatus(sessionID, params.ThreadID, params.Status)
 	case "thread/started":
 		var params struct {
 			Thread struct {
+				ID     string            `json:"id"`
 				Status codexThreadStatus `json:"status"`
 			} `json:"thread"`
 		}
 		if json.Unmarshal(message.Params, &params) == nil {
-			applyCodexThreadStatus(sessionID, params.Thread.Status)
+			applyCodexThreadStatus(sessionID, params.Thread.ID, params.Thread.Status)
 		}
 	case "turn/started":
-		setAiStatusAuthoritative(sessionID, "working", "")
+		setCodexThreadActivity(sessionID, codexThreadID(message.Params), true)
 	case "turn/completed":
-		setAiStatusAuthoritative(sessionID, "idle", "")
+		setCodexThreadActivity(sessionID, codexThreadID(message.Params), false)
 	}
 }
 
@@ -362,20 +374,73 @@ type codexThreadStatus struct {
 	ActiveFlags []string `json:"activeFlags"`
 }
 
-func applyCodexThreadStatus(sessionID string, status codexThreadStatus) {
+func codexThreadID(raw json.RawMessage) string {
+	var params struct {
+		ThreadID string `json:"threadId"`
+	}
+	_ = json.Unmarshal(raw, &params)
+	return params.ThreadID
+}
+
+func applyCodexThreadStatus(sessionID, threadID string, status codexThreadStatus) {
 	switch status.Type {
 	case "active":
 		// Waiting for an approval is waiting for the operator, not active work.
 		for _, flag := range status.ActiveFlags {
 			if flag == "waitingOnApproval" {
-				setAiStatusAuthoritative(sessionID, "idle", "")
+				setCodexThreadActivity(sessionID, threadID, false)
 				return
 			}
 		}
-		setAiStatusAuthoritative(sessionID, "working", "")
+		setCodexThreadActivity(sessionID, threadID, true)
 	case "idle", "notLoaded", "systemError":
+		setCodexThreadActivity(sessionID, threadID, false)
+	}
+}
+
+func setCodexThreadActivity(sessionID, threadID string, active bool) {
+	if threadID == "" {
+		// Older app-server builds omitted threadId. Preserve their original
+		// single-thread behaviour without letting that anonymous slot collide
+		// with a real thread ID.
+		threadID = anonymousCodexThread
+	}
+
+	codexActivityMu.Lock()
+	threads := codexActivities[sessionID]
+	if threads == nil && active {
+		threads = map[string]bool{}
+		codexActivities[sessionID] = threads
+	}
+	if active {
+		threads[threadID] = true
+	} else if threads != nil {
+		delete(threads, threadID)
+		if len(threads) == 0 {
+			delete(codexActivities, sessionID)
+		}
+	}
+	working := len(threads) > 0
+	codexActivityMu.Unlock()
+
+	if working {
+		setAiStatusAuthoritative(sessionID, "working", "")
+	} else {
 		setAiStatusAuthoritative(sessionID, "idle", "")
 	}
+}
+
+func resetCodexActivity(sessionID string) {
+	codexActivityMu.Lock()
+	delete(codexActivities, sessionID)
+	codexActivityMu.Unlock()
+	setAiStatusAuthoritative(sessionID, "idle", "")
+}
+
+func clearCodexActivity(sessionID string) {
+	codexActivityMu.Lock()
+	delete(codexActivities, sessionID)
+	codexActivityMu.Unlock()
 }
 
 func stopCodexAppServer(sessionID string) {
@@ -401,6 +466,7 @@ func (runtime *codexAppServerRuntime) stop() {
 			delete(codexRuntimes, runtime.sessionID)
 		}
 		codexRuntimesMu.Unlock()
+		clearCodexActivity(runtime.sessionID)
 		clearAiStatus(runtime.sessionID)
 	})
 }

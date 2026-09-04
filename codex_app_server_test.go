@@ -91,22 +91,41 @@ func TestCodexAppServerStatusEvents(t *testing.T) {
 	t.Cleanup(func() { clearAiStatusForTest(sessionID) })
 
 	assertEventStatus(t, sessionID,
-		`{"method":"thread/status/changed","params":{"status":{"type":"idle"}}}`,
+		`{"method":"thread/status/changed","params":{"threadId":"main","status":{"type":"idle"}}}`,
 		"idle")
 	assertEventStatus(t, sessionID,
-		`{"method":"thread/status/changed","params":{"status":{"type":"active","activeFlags":[]}}}`,
+		`{"method":"thread/status/changed","params":{"threadId":"main","status":{"type":"active","activeFlags":[]}}}`,
 		"working")
 	assertEventStatus(t, sessionID,
-		`{"method":"thread/status/changed","params":{"status":{"type":"active","activeFlags":["waitingOnApproval"]}}}`,
+		`{"method":"thread/status/changed","params":{"threadId":"main","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}`,
 		"idle")
 	assertEventStatus(t, sessionID,
-		`{"method":"turn/started","params":{"turn":{"status":"inProgress"}}}`,
+		`{"method":"turn/started","params":{"threadId":"main","turn":{"status":"inProgress"}}}`,
 		"working")
 	assertEventStatus(t, sessionID,
-		`{"method":"thread/started","params":{"thread":{"status":{"type":"active","activeFlags":[]}}}}`,
+		`{"method":"thread/started","params":{"thread":{"id":"main","status":{"type":"active","activeFlags":[]}}}}`,
 		"working")
 	assertEventStatus(t, sessionID,
-		`{"method":"turn/completed","params":{"turn":{"status":"completed"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"main","turn":{"status":"completed"}}}`,
+		"idle")
+}
+
+func TestCodexAppServerAggregatesConcurrentThreads(t *testing.T) {
+	const sessionID = "pty_codex_multi_thread_test"
+	clearAiStatusForTest(sessionID)
+	t.Cleanup(func() { clearAiStatusForTest(sessionID) })
+
+	assertEventStatus(t, sessionID,
+		`{"method":"turn/started","params":{"threadId":"main","turn":{"status":"inProgress"}}}`,
+		"working")
+	assertEventStatus(t, sessionID,
+		`{"method":"turn/started","params":{"threadId":"subagent","turn":{"status":"inProgress"}}}`,
+		"working")
+	assertEventStatus(t, sessionID,
+		`{"method":"turn/completed","params":{"threadId":"subagent","turn":{"status":"completed"}}}`,
+		"working")
+	assertEventStatus(t, sessionID,
+		`{"method":"turn/completed","params":{"threadId":"main","turn":{"status":"completed"}}}`,
 		"idle")
 }
 
@@ -269,6 +288,7 @@ func assertEventStatus(t *testing.T, sessionID, event, want string) {
 }
 
 func clearAiStatusForTest(sessionID string) {
+	clearCodexActivity(sessionID)
 	aiStatusMu.Lock()
 	delete(aiStatuses, sessionID)
 	aiStatusMu.Unlock()
