@@ -1644,6 +1644,9 @@ func buildMux() *http.ServeMux {
 	mux.HandleFunc("/api/pty", accessByMethod(handleListPty))
 	mux.HandleFunc("/api/pty/", accessByMethod(handlePtyAPI))
 	mux.HandleFunc("/api/daemon/name", requireDaemonAccess(accessOperate, handleDaemonName))
+	mux.HandleFunc("/api/push/subscription", requireDaemonAccess(accessOperate, handlePushSubscription))
+	mux.HandleFunc("/api/push/jobs", requireDaemonAccess(accessOperate, handlePushJobs))
+	mux.HandleFunc("/api/push/jobs/", requireDaemonAccess(accessOperate, handlePushJobs))
 	mux.HandleFunc("/api/board/items", accessByMethod(handleBoardItems))
 	mux.HandleFunc("/api/board/items/", accessByMethod(handleBoardItems))
 	mux.HandleFunc("/api/board/layouts", accessByMethod(handleBoardLayouts))
@@ -2276,6 +2279,9 @@ func initDB() {
 	// unconditionally so `ab-pty relay status` answers everywhere.
 	initRelayTable()
 	initDaemonName()
+	if err := initPushTables(); err != nil {
+		log.Fatal(err)
+	}
 
 	// Explicit daemon-to-daemon links. A peer fingerprint is the identity;
 	// its relay is only the selected route to that identity.
@@ -6433,14 +6439,19 @@ func setAiStatus(ptyID, status, tool string) {
 
 func setAiStatusAuthoritative(ptyID, status, tool string) {
 	aiStatusMu.Lock()
-	aiStatuses[ptyID] = aiStatusEntry{
+	previous, hadPrevious := aiStatuses[ptyID]
+	next := aiStatusEntry{
 		Status:        status,
 		Tool:          tool,
 		UpdatedAt:     time.Now(),
 		Authoritative: true,
 	}
+	aiStatuses[ptyID] = next
 	aiStatusMu.Unlock()
 	go broadcastPtyState()
+	if authoritativeCompletion(previous, hadPrevious, status) {
+		schedulePushCompletion(ptyID, next.UpdatedAt)
+	}
 }
 
 func clearAiStatus(ptyID string) {
