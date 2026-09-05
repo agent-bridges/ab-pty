@@ -147,6 +147,27 @@ func TestAuthoritativeStatusDoesNotExpire(t *testing.T) {
 	}
 }
 
+func TestDuplicateAuthoritativeStatusKeepsTransitionTimestamp(t *testing.T) {
+	const sessionID = "pty_codex_duplicate_status_test"
+	clearAiStatusForTest(sessionID)
+	t.Cleanup(func() { clearAiStatusForTest(sessionID) })
+
+	setAiStatusAuthoritative(sessionID, "idle", "")
+	first, ok := getAiStatusEntry(sessionID)
+	if !ok {
+		t.Fatal("initial authoritative status is missing")
+	}
+	time.Sleep(time.Millisecond)
+	setAiStatusAuthoritative(sessionID, "idle", "")
+	second, ok := getAiStatusEntry(sessionID)
+	if !ok {
+		t.Fatal("duplicate authoritative status is missing")
+	}
+	if !second.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("duplicate status changed transition time: first=%s second=%s", first.UpdatedAt, second.UpdatedAt)
+	}
+}
+
 func TestStringSliceFromJSON(t *testing.T) {
 	got := stringSliceFromJSON([]interface{}{"codex", "--full-auto"})
 	if len(got) != 2 || got[0] != "codex" || got[1] != "--full-auto" {

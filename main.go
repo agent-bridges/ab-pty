@@ -6440,6 +6440,14 @@ func setAiStatus(ptyID, status, tool string) {
 func setAiStatusAuthoritative(ptyID, status, tool string) {
 	aiStatusMu.Lock()
 	previous, hadPrevious := aiStatuses[ptyID]
+	// App-server reports the same state through overlapping notifications
+	// (notably thread/status/changed=idle followed by turn/completed). Treat an
+	// identical authoritative state as idempotent: refreshing UpdatedAt here
+	// would invalidate the completion debounce scheduled by the first event.
+	if hadPrevious && previous.Authoritative && previous.Status == status && previous.Tool == tool {
+		aiStatusMu.Unlock()
+		return
+	}
 	next := aiStatusEntry{
 		Status:        status,
 		Tool:          tool,

@@ -268,6 +268,15 @@ type codexWebSocketObserver struct {
 	fragmentedMessage []byte
 	skippedPayload    uint64
 	skippingFragment  bool
+	tracedFrames      int
+}
+
+func codexAppServerTraceEnabled(sessionID string) bool {
+	if os.Getenv("AB_PTY_CODEX_APP_SERVER_TRACE") != "1" {
+		return false
+	}
+	target := strings.TrimSpace(os.Getenv("AB_PTY_CODEX_APP_SERVER_TRACE_PTY"))
+	return target == "" || target == sessionID
 }
 
 func (observer *codexWebSocketObserver) Write(data []byte) (int, error) {
@@ -284,6 +293,9 @@ func (observer *codexWebSocketObserver) Write(data []byte) (int, error) {
 		}
 		observer.buffer = append([]byte(nil), observer.buffer[headerEnd+4:]...)
 		observer.handshakeComplete = true
+		if codexAppServerTraceEnabled(observer.sessionID) {
+			log.Printf("Codex app-server websocket ready pty=%s", observer.sessionID)
+		}
 	}
 
 	for {
@@ -333,6 +345,13 @@ func (observer *codexWebSocketObserver) consumeFrame() bool {
 	}
 	if masked {
 		headerLength += 4
+	}
+	if codexAppServerTraceEnabled(observer.sessionID) && observer.tracedFrames < 32 {
+		observer.tracedFrames++
+		log.Printf(
+			"Codex app-server frame pty=%s number=%d opcode=%d final=%t masked=%t payload=%d buffered=%d",
+			observer.sessionID, observer.tracedFrames, opcode, final, masked, payloadLength, len(observer.buffer),
+		)
 	}
 
 	if payloadLength > maxCodexObservedMessage {
@@ -402,7 +421,7 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 	if err := json.Unmarshal(line, &message); err != nil || message.Method == "" {
 		return
 	}
-	if os.Getenv("AB_PTY_CODEX_APP_SERVER_TRACE") == "1" {
+	if codexAppServerTraceEnabled(sessionID) {
 		log.Printf("Codex app-server event pty=%s: %s", sessionID, string(line))
 	}
 
