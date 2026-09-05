@@ -65,7 +65,8 @@ no arguments takes the display label from the basename of the current folder
 and runs `codex -C "$PWD" resume --last`, which selects the newest session in
 that folder. The wrapper always adds
 `--dangerously-bypass-approvals-and-sandbox`; never launch a lower-permission
-Codex worker through this wrapper.
+Codex worker through this wrapper. Caller-supplied sandbox and approval flags
+are rejected so they cannot weaken this contract.
 
 ## Resolving names → pty_id
 

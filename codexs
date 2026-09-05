@@ -30,6 +30,18 @@ while (($#)); do
       codex_args+=("$1")
       shift
       ;;
+    --sandbox|-s|--ask-for-approval|-a)
+      echo "codexs: permission flags are fixed to full access" >&2
+      exit 2
+      ;;
+    --sandbox=*|--ask-for-approval=*|--approve-for-me|--full-auto)
+      echo "codexs: permission flags are fixed to full access" >&2
+      exit 2
+      ;;
+    --dangerously-bypass-approvals-and-sandbox|--yolo)
+      # The wrapper adds the canonical full-access flag exactly once.
+      shift
+      ;;
     *)
       codex_args+=("$1")
       shift

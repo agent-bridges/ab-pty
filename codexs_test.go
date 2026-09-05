@@ -82,4 +82,12 @@ func TestCodexWrapperDerivesAndAcceptsSessionLabel(t *testing.T) {
 	if len(codexArgs) == 0 || codexArgs[0] != "--dangerously-bypass-approvals-and-sandbox" {
 		t.Fatalf("full-access flag missing from Codex args: %q", codexArgs)
 	}
+
+	cmd := exec.Command("bash", filepath.Join(repoDir, "codexs"), "--sandbox", "read-only")
+	cmd.Dir = projectDir
+	cmd.Env = append(os.Environ(), "PATH="+binDir+":/usr/bin:/bin")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "permission flags are fixed to full access") {
+		t.Fatalf("reduced permissions were not rejected: err=%v output=%q", err, out)
+	}
 }
