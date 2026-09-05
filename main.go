@@ -288,6 +288,7 @@ func (s *Session) setWinsize(rows, cols int) {
 type SessionMeta struct {
 	ID        string
 	Name      string
+	Label     string
 	Locked    bool
 	Meta      map[string]interface{}
 	CreatedAt time.Time
@@ -1609,6 +1610,7 @@ func buildMux() *http.ServeMux {
 	// Safe methods admit read-only certificates; mutations require operator.
 	mux.HandleFunc("/api/pty", accessByMethod(handleListPty))
 	mux.HandleFunc("/api/pty/", accessByMethod(handlePtyAPI))
+	mux.HandleFunc("/api/daemon/name", requireDaemonAccess(accessOperate, handleDaemonName))
 	mux.HandleFunc("/api/board/items", accessByMethod(handleBoardItems))
 	mux.HandleFunc("/api/board/items/", accessByMethod(handleBoardItems))
 	mux.HandleFunc("/api/board/layouts", accessByMethod(handleBoardLayouts))
@@ -1961,6 +1963,7 @@ const sessionMetaTableDDL = `
 	CREATE TABLE session_meta (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL DEFAULT '',
+		label TEXT NOT NULL DEFAULT '',
 		locked INTEGER NOT NULL DEFAULT 0,
 		active INTEGER NOT NULL DEFAULT 0,
 		meta TEXT NOT NULL DEFAULT '{}',
@@ -1971,6 +1974,7 @@ const sessionMetaTableDDL = `
 type persistedSessionMetaRow struct {
 	id        string
 	name      string
+	label     string
 	locked    int
 	active    int
 	meta      string
@@ -1978,11 +1982,9 @@ type persistedSessionMetaRow struct {
 	updatedAt interface{}
 }
 
-// ensureSessionMetaSchema installs the name-only session identity schema. The
-// previous daemon stored the mutable session name in meta.project_name and a
-// separate display label in session_meta.label. This is the deployment-boundary
-// migration: copy the real name into its own column, discard the label column,
-// and remove project_name from the opaque metadata blob.
+// ensureSessionMetaSchema installs the canonical session identity schema. ID
+// and name remain the routable identity; label is daemon-owned display text
+// shared by every client. Legacy project_name values are promoted into name.
 func ensureSessionMetaSchema(database *sql.DB) error {
 	rows, err := database.Query(`PRAGMA table_info(session_meta)`)
 	if err != nil {
@@ -2011,7 +2013,7 @@ func ensureSessionMetaSchema(database *sql.DB) error {
 		return err
 	}
 
-	canonical := columns["id"] && columns["name"] && columns["locked"] && columns["active"] && columns["meta"] && columns["created_at"] && columns["updated_at"] && !columns["label"]
+	canonical := columns["id"] && columns["name"] && columns["label"] && columns["locked"] && columns["active"] && columns["meta"] && columns["created_at"] && columns["updated_at"]
 	if canonical {
 		_, err := database.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS session_meta_live_name_idx ON session_meta(name) WHERE active = 1`)
 		return err
@@ -2023,8 +2025,8 @@ func ensureSessionMetaSchema(database *sql.DB) error {
 		}
 		return fallback
 	}
-	query := fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s FROM session_meta ORDER BY id`,
-		columnExpr("id", `''`), columnExpr("name", `''`), columnExpr("locked", `0`),
+	query := fmt.Sprintf(`SELECT %s, %s, %s, %s, %s, %s, %s, %s FROM session_meta ORDER BY id`,
+		columnExpr("id", `''`), columnExpr("name", `''`), columnExpr("label", `''`), columnExpr("locked", `0`),
 		columnExpr("active", `0`), columnExpr("meta", `'{}'`),
 		columnExpr("created_at", `CURRENT_TIMESTAMP`), columnExpr("updated_at", `CURRENT_TIMESTAMP`))
 	legacyRows, err := database.Query(query)
@@ -2035,7 +2037,7 @@ func ensureSessionMetaSchema(database *sql.DB) error {
 	liveNames := map[string]bool{}
 	for legacyRows.Next() {
 		var row persistedSessionMetaRow
-		if err := legacyRows.Scan(&row.id, &row.name, &row.locked, &row.active, &row.meta, &row.createdAt, &row.updatedAt); err != nil {
+		if err := legacyRows.Scan(&row.id, &row.name, &row.label, &row.locked, &row.active, &row.meta, &row.createdAt, &row.updatedAt); err != nil {
 			legacyRows.Close()
 			return fmt.Errorf("scan legacy session_meta: %w", err)
 		}
@@ -2076,22 +2078,22 @@ func ensureSessionMetaSchema(database *sql.DB) error {
 		_ = tx.Rollback()
 		return cause
 	}
-	if _, err := tx.Exec(`DROP TABLE IF EXISTS session_meta_name_only`); err != nil {
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS session_meta_canonical`); err != nil {
 		return rollback(err)
 	}
-	if _, err := tx.Exec(strings.Replace(sessionMetaTableDDL, "session_meta", "session_meta_name_only", 1)); err != nil {
+	if _, err := tx.Exec(strings.Replace(sessionMetaTableDDL, "session_meta", "session_meta_canonical", 1)); err != nil {
 		return rollback(err)
 	}
 	for _, row := range saved {
-		if _, err := tx.Exec(`INSERT INTO session_meta_name_only (id, name, locked, active, meta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			row.id, row.name, row.locked, row.active, row.meta, row.createdAt, row.updatedAt); err != nil {
+		if _, err := tx.Exec(`INSERT INTO session_meta_canonical (id, name, label, locked, active, meta, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			row.id, row.name, row.label, row.locked, row.active, row.meta, row.createdAt, row.updatedAt); err != nil {
 			return rollback(err)
 		}
 	}
 	if _, err := tx.Exec(`DROP TABLE session_meta`); err != nil {
 		return rollback(err)
 	}
-	if _, err := tx.Exec(`ALTER TABLE session_meta_name_only RENAME TO session_meta`); err != nil {
+	if _, err := tx.Exec(`ALTER TABLE session_meta_canonical RENAME TO session_meta`); err != nil {
 		return rollback(err)
 	}
 	if _, err := tx.Exec(`CREATE UNIQUE INDEX session_meta_live_name_idx ON session_meta(name) WHERE active = 1`); err != nil {
@@ -2145,6 +2147,15 @@ func initDB() {
 	}
 
 	if err = ensureSessionMetaSchema(db); err != nil {
+		log.Fatal(err)
+	}
+	if _, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS daemon_settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
 		log.Fatal(err)
 	}
 
@@ -2485,11 +2496,11 @@ func deleteBoardLayout(name string) (bool, error) {
 }
 
 func getSessionMeta(sessionID string) *SessionMeta {
-	row := db.QueryRow("SELECT id, name, locked, meta, created_at, updated_at FROM session_meta WHERE id = ?", sessionID)
+	row := db.QueryRow("SELECT id, name, label, locked, meta, created_at, updated_at FROM session_meta WHERE id = ?", sessionID)
 	meta := &SessionMeta{}
 	var metaJSON string
 	var locked int
-	err := row.Scan(&meta.ID, &meta.Name, &locked, &metaJSON, &meta.CreatedAt, &meta.UpdatedAt)
+	err := row.Scan(&meta.ID, &meta.Name, &meta.Label, &locked, &metaJSON, &meta.CreatedAt, &meta.UpdatedAt)
 	if err != nil {
 		return nil
 	}
@@ -2498,7 +2509,93 @@ func getSessionMeta(sessionID string) *SessionMeta {
 	return meta
 }
 
-func setSessionMeta(sessionID string, name *string, locked *bool, metaUpdate map[string]interface{}) *SessionMeta {
+func daemonName() string {
+	if db != nil {
+		var name string
+		if err := db.QueryRow(`SELECT value FROM daemon_settings WHERE key = 'name'`).Scan(&name); err == nil {
+			if name = strings.TrimSpace(name); name != "" {
+				return name
+			}
+		}
+	}
+	hostname, _ := os.Hostname()
+	return strings.TrimSpace(hostname)
+}
+
+func validateDisplayLabel(kind, value string, allowEmpty bool) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" && !allowEmpty {
+		return "", fmt.Errorf("%s must not be empty", kind)
+	}
+	if len(value) > 128 {
+		return "", fmt.Errorf("%s must not exceed 128 bytes", kind)
+	}
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return "", fmt.Errorf("%s must not contain newlines or NUL", kind)
+	}
+	return value, nil
+}
+
+func saveDaemonName(requested string) (string, error) {
+	name, err := validateDisplayLabel("daemon name", requested, false)
+	if err != nil {
+		return "", err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
+	}
+	rollback := func(cause error) (string, error) {
+		_ = tx.Rollback()
+		return "", cause
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO daemon_settings (key, value, updated_at)
+		VALUES ('name', ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+	`, name); err != nil {
+		return rollback(err)
+	}
+	// One daemon has one display name regardless of which relay carries it.
+	// Updating every stored route also wakes the relay manager so directories
+	// receive the new name on the next reconnect.
+	if _, err := tx.Exec(`UPDATE relay_configs SET label = ?, updated_at = CURRENT_TIMESTAMP`, name); err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func handleDaemonName(w http.ResponseWriter, r *http.Request) {
+	if allowOptions(w, r, "GET, PATCH, OPTIONS") {
+		return
+	}
+	if r.Method == http.MethodGet {
+		writeJSON(w, 0, map[string]interface{}{"name": daemonName()})
+		return
+	}
+	if r.Method != http.MethodPatch {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+	name, err := saveDaemonName(body.Name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, 0, map[string]interface{}{"ok": true, "name": name})
+}
+
+func setSessionMeta(sessionID string, name *string, label *string, locked *bool, metaUpdate map[string]interface{}) *SessionMeta {
 	existing := getSessionMeta(sessionID)
 
 	if existing == nil {
@@ -2511,15 +2608,22 @@ func setSessionMeta(sessionID string, name *string, locked *bool, metaUpdate map
 		if name != nil {
 			nameVal = *name
 		}
+		labelVal := ""
+		if label != nil {
+			labelVal = *label
+		}
 		lockedVal := 0
 		if locked != nil && *locked {
 			lockedVal = 1
 		}
-		db.Exec("INSERT INTO session_meta (id, name, locked, active, meta) VALUES (?, ?, ?, 1, ?)",
-			sessionID, nameVal, lockedVal, metaJSON)
+		db.Exec("INSERT INTO session_meta (id, name, label, locked, active, meta) VALUES (?, ?, ?, ?, 1, ?)",
+			sessionID, nameVal, labelVal, lockedVal, metaJSON)
 	} else {
 		if name != nil {
 			db.Exec("UPDATE session_meta SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", *name, sessionID)
+		}
+		if label != nil {
+			db.Exec("UPDATE session_meta SET label = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", *label, sessionID)
 		}
 		if locked != nil {
 			lockedVal := 0
@@ -2824,7 +2928,7 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 	if len(originalCustomCmd) > 0 {
 		meta["launch_cmd"] = originalCustomCmd
 	}
-	setSessionMeta(sessionID, &name, nil, meta)
+	setSessionMeta(sessionID, &name, nil, nil, meta)
 
 	// Start reader goroutine
 	go readPtyLoop(session)
@@ -2910,7 +3014,7 @@ func trackAICmd(session *Session) {
 		}
 
 		if aiCmd != prev {
-			setSessionMeta(session.ID, nil, nil, map[string]interface{}{
+			setSessionMeta(session.ID, nil, nil, nil, map[string]interface{}{
 				"last_ai_cmd": aiCmd,
 			})
 		}
@@ -2961,7 +3065,7 @@ func updateSessionCwd(sessionID, cwd string) {
 		meta.Meta = make(map[string]interface{})
 	}
 	meta.Meta["last_cwd"] = cwd
-	setSessionMeta(sessionID, nil, nil, meta.Meta)
+	setSessionMeta(sessionID, nil, nil, nil, meta.Meta)
 }
 
 // trackClaudeSession watches for new Claude session files and links them to the PTY
@@ -3051,7 +3155,7 @@ func trackClaudeSession(session *Session) {
 				meta.Meta = make(map[string]interface{})
 			}
 			meta.Meta["claude_session_id"] = newestSession
-			setSessionMeta(session.ID, nil, nil, meta.Meta)
+			setSessionMeta(session.ID, nil, nil, nil, meta.Meta)
 			broadcastPtyState()
 			return
 		}
@@ -3441,9 +3545,11 @@ func broadcastPtyState() {
 	for _, s := range sessions {
 		meta := getSessionMeta(s.ID)
 		locked := false
+		label := ""
 		claudeSessionID := ""
 		if meta != nil {
 			locked = meta.Locked
+			label = meta.Label
 			if csid, ok := meta.Meta["claude_session_id"].(string); ok {
 				claudeSessionID = csid
 			}
@@ -3510,6 +3616,7 @@ func broadcastPtyState() {
 		state = append(state, map[string]interface{}{
 			"id":                s.ID,
 			"name":              s.Name,
+			"label":             label,
 			"project_path":      s.ProjectPath,
 			"last_cwd":          lastCwd,
 			"created_at":        s.CreatedAt.Format(time.RFC3339),
@@ -4272,6 +4379,7 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	// every peer already sees the whole certificate during the handshake.
 	info := map[string]interface{}{
 		"version":  Version,
+		"name":     daemonName(),
 		"hostname": hostname,
 		"sessions": sessionCount,
 		"port":     port,
@@ -4342,10 +4450,6 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "Invalid JSON")
 			return
 		}
-		if _, exists := data["label"]; exists {
-			writeError(w, http.StatusBadRequest, "session label is not supported; use name")
-			return
-		}
 		if _, exists := data["project_name"]; exists {
 			writeError(w, http.StatusBadRequest, "project_name is not a session identity field; use name")
 			return
@@ -4359,6 +4463,13 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 		cols := int(getFloat(data, "cols", 120))
 		shellOnly, _ := data["shell_only"].(bool)
 		name, _ := data["name"].(string)
+		label, _ := data["label"].(string)
+		validatedLabel, err := validateDisplayLabel("session label", label, true)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		label = validatedLabel
 		continueSession, _ := data["continue_session"].(string)
 
 		// Parse custom command if provided
@@ -4397,6 +4508,9 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if label != "" {
+			setSessionMeta(session.ID, nil, &label, nil, nil)
+		}
 
 		go broadcastPtyState()
 
@@ -4407,6 +4521,7 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 			"ok":           true,
 			"session_id":   session.ID,
 			"name":         createdName,
+			"label":        label,
 			"project_path": session.ProjectPath,
 			"type":         map[bool]string{true: "bash", false: "claude"}[session.ShellOnly],
 		})
@@ -4420,9 +4535,11 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 	for _, s := range sessions {
 		meta := getSessionMeta(s.ID)
 		locked := false
+		label := ""
 		metaData := map[string]interface{}{}
 		if meta != nil {
 			locked = meta.Locked
+			label = meta.Label
 			metaData = meta.Meta
 		}
 
@@ -4439,6 +4556,7 @@ func handleListPty(w http.ResponseWriter, r *http.Request) {
 		result = append(result, map[string]interface{}{
 			"id":              s.ID,
 			"name":            s.Name,
+			"label":           label,
 			"project_path":    s.ProjectPath,
 			"created_at":      s.CreatedAt.Format(time.RFC3339),
 			"clients":         clientCount,
@@ -4459,7 +4577,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse path: /api/pty/{session_id}[/lock|/meta|/name]. HTTP routing is
+	// Parse path: /api/pty/{session_id}[/lock|/meta|/name|/label]. HTTP routing is
 	// deliberately ID-only; name resolution belongs to the convenience CLI.
 	path := r.URL.Path[len("/api/pty/"):]
 	parts := filepath.SplitList(path)
@@ -4501,9 +4619,11 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		sessionsMu.RUnlock()
 		meta := getSessionMeta(sessionID)
 		locked := false
+		label := ""
 		metaData := map[string]interface{}{}
 		if meta != nil {
 			locked = meta.Locked
+			label = meta.Label
 			metaData = meta.Meta
 		}
 		sessionType := "claude"
@@ -4517,6 +4637,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 0, map[string]interface{}{
 			"id":              session.ID,
 			"name":            sessionName,
+			"label":           label,
 			"project_path":    session.ProjectPath,
 			"created_at":      session.CreatedAt.Format(time.RFC3339),
 			"clients":         clientCount,
@@ -4529,13 +4650,13 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 
 	case action == "lock" && r.Method == "POST":
 		locked := true
-		setSessionMeta(sessionID, nil, &locked, nil)
+		setSessionMeta(sessionID, nil, nil, &locked, nil)
 		broadcastPtyState()
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "locked": true})
 
 	case action == "lock" && r.Method == "DELETE":
 		locked := false
-		setSessionMeta(sessionID, nil, &locked, nil)
+		setSessionMeta(sessionID, nil, nil, &locked, nil)
 		broadcastPtyState()
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "locked": false})
 
@@ -4546,7 +4667,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, exists := data["label"]; exists {
-			writeError(w, http.StatusBadRequest, "session label is not supported; use name")
+			writeError(w, http.StatusBadRequest, "use PATCH /api/pty/{id}/label to change a session label")
 			return
 		}
 		if _, exists := data["name"]; exists {
@@ -4564,14 +4685,32 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		meta := setSessionMeta(sessionID, nil, nil, metaUpdate)
+		meta := setSessionMeta(sessionID, nil, nil, nil, metaUpdate)
 		resp := map[string]interface{}{"ok": true, "id": sessionID, "meta": meta.Meta}
 		sessionsMu.RLock()
 		if s, ok := sessions[sessionID]; ok {
 			resp["name"] = s.Name
 		}
 		sessionsMu.RUnlock()
+		resp["label"] = meta.Label
 		writeJSON(w, 0, resp)
+
+	case action == "label" && r.Method == http.MethodPatch:
+		var body struct {
+			Label string `json:"label"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+		label, err := validateDisplayLabel("session label", body.Label, true)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		meta := setSessionMeta(sessionID, nil, &label, nil, nil)
+		go broadcastPtyState()
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "id": sessionID, "name": meta.Name, "label": meta.Label})
 
 	case action == "name" && r.Method == "PATCH":
 		var body struct {

@@ -40,20 +40,23 @@ remote target is named explicitly as `<link>/<session>`.
 - `ab sessions key [link/]<pty_id|name> <key>` — send an explicit key press. Supported: `enter`, `tab`, `esc`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `ctrl-c`, `ctrl-d`, `ctrl-z`, `ctrl-l`, `ctrl-u`, `ctrl-w`. Use to interrupt a running command (`ctrl-c`), navigate a TUI menu (arrows + `enter`), or submit a previously-drafted `write` (`enter`).
 - `ab sessions tail [link/]<pty_id|name> --lines 50` — read recent scrollback as JSON.
 - `ab sessions kill [link/]<pty_id|name>` — terminate a session.
-- `ab sessions rename [link/]<pty_id|name> <new-name>` — change the sole mutable/displayed session name.
+- `ab sessions rename [link/]<pty_id|name> <new-name>` — change the unique canonical session name used by the CLI.
 - `ab sessions meta [link/]<pty_id|name> [--set k=v ...]` — update non-identity metadata.
 - `ab sessions lock [link/]<pty_id|name>` / `ab sessions unlock [link/]<pty_id|name>`.
 
 ## Session identity
 
-Every session has exactly two public identity fields:
+Every session has three public naming fields:
 
 - `id` — immutable, daemon-generated, and the only value accepted in HTTP paths.
-- `name` — unique among live sessions and the only mutable/displayed name.
+- `name` — mutable canonical name, unique among live sessions and accepted by the CLI resolver.
+- `label` — mutable daemon-owned display text shared by all clients; it may repeat and an empty label explicitly means “display `name`”.
 
 Create a named session in one step: `ab sessions create -shell -project /tmp -name s1`.
-Rename it with `ab sessions rename s1 dev1`. Do not derive a display identity
-from cwd, project basename, board state, or metadata after creation.
+Rename its canonical CLI name with `ab sessions rename s1 dev1`. UI clients
+change the display label through `PATCH /api/pty/{id}/label`; labels are not
+stored locally and never participate in routing. The daemon also owns its
+machine name through `PATCH /api/daemon/name` and advertises it to every relay.
 
 ## Resolving names → pty_id
 

@@ -691,9 +691,11 @@ func (m *relayManager) connectOnce(cfg RelayConfig, stop <-chan struct{}) error 
 	}
 	defer conn.Close()
 
-	label := cfg.Label
+	// The daemon owns one name. Relay routes are transport choices, not
+	// separate client-side identities for the same machine.
+	label := daemonName()
 	if label == "" {
-		label, _ = os.Hostname()
+		label = cfg.Label
 	}
 	_ = conn.SetDeadline(time.Now().Add(relayDialTimeout))
 	if _, err := fmt.Fprintf(conn, "%s %s label=%s version=%s\n", relayProtoMagic, relayRoleCtl, sanitizeToken(label), Version); err != nil {

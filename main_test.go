@@ -62,6 +62,7 @@ func initTestDB() {
 		CREATE TABLE IF NOT EXISTS session_meta (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL DEFAULT '',
+			label TEXT NOT NULL DEFAULT '',
 			locked INTEGER DEFAULT 0,
 			active INTEGER DEFAULT 1,
 			meta TEXT DEFAULT '{}',
@@ -72,6 +73,26 @@ func initTestDB() {
 		panic(err)
 	}
 	if _, err := db.Exec(`DELETE FROM session_meta`); err != nil {
+		panic(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS daemon_settings (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		panic(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS relay_configs (
+		name TEXT PRIMARY KEY,
+		enabled INTEGER NOT NULL DEFAULT 0,
+		address TEXT NOT NULL DEFAULT '',
+		label TEXT NOT NULL DEFAULT '',
+		pin TEXT NOT NULL DEFAULT '',
+		last_success DATETIME,
+		last_error TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL DEFAULT 'disconnected',
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
 		panic(err)
 	}
 }
@@ -451,7 +472,7 @@ func TestSessionMeta(t *testing.T) {
 
 	// Test create
 	name := "test-name"
-	meta := setSessionMeta("test-session-1", &name, nil, nil)
+	meta := setSessionMeta("test-session-1", &name, nil, nil, nil)
 
 	if meta == nil {
 		t.Fatal("Expected meta to be created")
@@ -462,20 +483,20 @@ func TestSessionMeta(t *testing.T) {
 
 	// Test lock
 	locked := true
-	meta = setSessionMeta("test-session-1", nil, &locked, nil)
+	meta = setSessionMeta("test-session-1", nil, nil, &locked, nil)
 	if !meta.Locked {
 		t.Error("Expected session to be locked")
 	}
 
 	// Test unlock
 	locked = false
-	meta = setSessionMeta("test-session-1", nil, &locked, nil)
+	meta = setSessionMeta("test-session-1", nil, nil, &locked, nil)
 	if meta.Locked {
 		t.Error("Expected session to be unlocked")
 	}
 
 	// Test meta update
-	meta = setSessionMeta("test-session-1", nil, nil, map[string]interface{}{
+	meta = setSessionMeta("test-session-1", nil, nil, nil, map[string]interface{}{
 		"claude_session_id": "abc123",
 	})
 	if meta.Meta["claude_session_id"] != "abc123" {
@@ -492,7 +513,42 @@ func TestSessionMeta(t *testing.T) {
 	}
 }
 
-func TestEnsureSessionMetaSchemaMigratesNameAndDropsLabel(t *testing.T) {
+func TestDaemonNameIsStoredAndAppliedToEveryRelayRoute(t *testing.T) {
+	initTestDB()
+	if _, err := db.Exec(`DELETE FROM daemon_settings`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM relay_configs`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO relay_configs (name, address, label) VALUES ('home', 'home:9500', 'old-home'), ('remote', 'remote:9500', 'old-remote')`); err != nil {
+		t.Fatal(err)
+	}
+
+	name, err := saveDaemonName("shared-daemon-name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "shared-daemon-name" || daemonName() != name {
+		t.Fatalf("daemon name was not persisted: saved=%q loaded=%q", name, daemonName())
+	}
+	rows, err := db.Query(`SELECT label FROM relay_configs ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			t.Fatal(err)
+		}
+		if label != name {
+			t.Fatalf("relay route retained a different daemon label %q", label)
+		}
+	}
+}
+
+func TestEnsureSessionMetaSchemaMigratesNameAndPreservesLabel(t *testing.T) {
 	legacyDB, err := sql.Open("sqlite3", "file:abpty_legacy_schema?mode=memory&cache=shared")
 	if err != nil {
 		t.Fatal(err)
@@ -533,16 +589,19 @@ func TestEnsureSessionMetaSchemaMigratesNameAndDropsLabel(t *testing.T) {
 		columns[name] = true
 	}
 	rows.Close()
-	if !columns["name"] || columns["label"] {
-		t.Fatalf("expected name-only identity schema, columns=%v", columns)
+	if !columns["name"] || !columns["label"] {
+		t.Fatalf("expected name and label identity schema, columns=%v", columns)
 	}
 
-	var name, metaJSON string
-	if err := legacyDB.QueryRow(`SELECT name, meta FROM session_meta WHERE id = 'pty_1_12345'`).Scan(&name, &metaJSON); err != nil {
+	var name, label, metaJSON string
+	if err := legacyDB.QueryRow(`SELECT name, label, meta FROM session_meta WHERE id = 'pty_1_12345'`).Scan(&name, &label, &metaJSON); err != nil {
 		t.Fatal(err)
 	}
 	if name != "persisted-name" {
 		t.Fatalf("expected migrated name, got %q", name)
+	}
+	if label != "discard-me" {
+		t.Fatalf("expected preserved label, got %q", label)
 	}
 	var meta map[string]interface{}
 	if err := json.Unmarshal([]byte(metaJSON), &meta); err != nil {
@@ -735,7 +794,7 @@ func TestPtyDeleteAPI(t *testing.T) {
 	}
 }
 
-func TestPtyMetaUpdateAPIRejectsSessionLabel(t *testing.T) {
+func TestPtyLabelAPIStoresServerLabel(t *testing.T) {
 	initTestDB()
 
 	// Create session
@@ -749,23 +808,24 @@ func TestPtyMetaUpdateAPIRejectsSessionLabel(t *testing.T) {
 	}
 	defer killSession(session.ID)
 
-	// Session label is no longer part of the contract.
-	body := strings.NewReader(`{"label":"my-label","meta":{"custom":"value"}}`)
-	req := httptest.NewRequest("PATCH", "/api/pty/test-meta-session/meta", body)
+	body := strings.NewReader(`{"label":"my-label"}`)
+	req := httptest.NewRequest("PATCH", "/api/pty/test-meta-session/label", body)
 	w := httptest.NewRecorder()
 	handlePtyAPI(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("Expected status 400, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if strings.Contains(w.Body.String(), `"label":"my-label"`) {
-		t.Fatalf("response retained the removed session label: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), `"label":"my-label"`) {
+		t.Fatalf("response did not contain stored session label: %s", w.Body.String())
+	}
+	if meta := getSessionMeta(session.ID); meta == nil || meta.Label != "my-label" {
+		t.Fatalf("session label was not persisted: %#v", meta)
 	}
 }
 
 func TestPtyCreateAPIRejectsLegacyIdentityFields(t *testing.T) {
 	for _, body := range []string{
-		`{"project_path":"/tmp","shell_only":true,"label":"legacy"}`,
 		`{"project_path":"/tmp","shell_only":true,"project_name":"legacy"}`,
 	} {
 		req := httptest.NewRequest(http.MethodPost, "/api/pty", strings.NewReader(body))
@@ -858,9 +918,6 @@ func TestPtyRenameAPIIsUniqueAndPersistent(t *testing.T) {
 	if resp["id"] != first.ID || resp["name"] != "gamma" {
 		t.Fatalf("unexpected rename response: %v", resp)
 	}
-	if _, exists := resp["label"]; exists {
-		t.Fatalf("rename response exposed removed label: %v", resp)
-	}
 	if persisted := getSessionMeta(first.ID); persisted == nil || persisted.Name != "gamma" {
 		t.Fatalf("renamed name was not persisted: %#v", persisted)
 	}
@@ -913,8 +970,8 @@ func TestPtyMetaUpdatePayloadHasOnlyCanonicalIdentity(t *testing.T) {
 	if resp["id"] != session.ID || resp["name"] != session.Name {
 		t.Fatalf("canonical identity missing: %v", resp)
 	}
-	if _, exists := resp["label"]; exists {
-		t.Fatalf("meta response exposed removed label: %v", resp)
+	if resp["label"] != "" {
+		t.Fatalf("meta response did not expose the empty server label: %v", resp)
 	}
 	meta, _ := resp["meta"].(map[string]interface{})
 	if meta["custom"] != "value" {
