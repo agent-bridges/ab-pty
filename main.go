@@ -1063,6 +1063,7 @@ Usage:
   ab sessions key    [link/]<pty_id|name> <key>        # enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|…
   ab sessions tail   [link/]<pty_id|name> [--lines N]  # alias: peek
   ab sessions rename [link/]<pty_id|name> <new-name>
+  ab sessions label  [link/]<pty_id|name> <display-label>
   ab sessions meta   [link/]<pty_id|name> [--set k=v ...]
   ab sessions lock   [link/]<pty_id|name>
   ab sessions unlock [link/]<pty_id|name>
@@ -1503,6 +1504,13 @@ func runClientSessions(args []string) {
 		link, id := resolve(rest[0])
 		body, _ := json.Marshal(map[string]string{"name": rest[1]})
 		out, err := sessionAPIRequest(link, "PATCH", "/api/pty/"+url.PathEscape(id)+"/name", body)
+		requireOK(err)
+		fmt.Println(string(out))
+	case "label":
+		requireArg(rest, 1, "label", "[link/]<pty_id|name> <display-label>")
+		link, id := resolve(rest[0])
+		body, _ := json.Marshal(map[string]string{"label": rest[1]})
+		out, err := sessionAPIRequest(link, "PATCH", "/api/pty/"+url.PathEscape(id)+"/label", body)
 		requireOK(err)
 		fmt.Println(string(out))
 	case "key":

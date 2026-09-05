@@ -49,7 +49,11 @@ var (
 const anonymousCodexThread = "_anonymous"
 
 func shouldUseCodexAppServer(customCmd []string) bool {
-	if len(customCmd) == 0 || filepath.Base(customCmd[0]) != "codex" {
+	if len(customCmd) == 0 {
+		return false
+	}
+	binary := filepath.Base(customCmd[0])
+	if binary != "codex" && binary != "codexs" {
 		return false
 	}
 	for _, arg := range customCmd[1:] {

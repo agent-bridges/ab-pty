@@ -41,6 +41,7 @@ remote target is named explicitly as `<link>/<session>`.
 - `ab sessions tail [link/]<pty_id|name> --lines 50` — read recent scrollback as JSON.
 - `ab sessions kill [link/]<pty_id|name>` — terminate a session.
 - `ab sessions rename [link/]<pty_id|name> <new-name>` — change the unique canonical session name used by the CLI.
+- `ab sessions label [link/]<pty_id|name> <display-label>` — change the daemon-owned display label without changing the routable name.
 - `ab sessions meta [link/]<pty_id|name> [--set k=v ...]` — update non-identity metadata.
 - `ab sessions lock [link/]<pty_id|name>` / `ab sessions unlock [link/]<pty_id|name>`.
 
@@ -57,6 +58,10 @@ Rename its canonical CLI name with `ab sessions rename s1 dev1`. UI clients
 change the display label through `PATCH /api/pty/{id}/label`; labels are not
 stored locally and never participate in routing. The daemon also owns its
 machine name through `PATCH /api/daemon/name` and advertises it to every relay.
+
+Launch Codex through `codexs`. Web/mobile-created Codex sessions pass
+`--ab-label <chosen-name>` to that same wrapper. A manual `codexs` launch with
+no `--ab-label` takes the display label from the basename of the current folder.
 
 ## Resolving names → pty_id
 
@@ -179,7 +184,7 @@ When sending the launch line via `ab sessions send <pty> "<command>"`, use the m
 | Agent | Local wrapper on this host | Underlying command | Notes |
 |---|---|---|---|
 | **Claude Code** | `claudes` (preferred) | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 IS_SANDBOX=1 claude --dangerously-skip-permissions` | Always use the wrapper, not raw `claude`. ⚠️ The wrapper MUST set `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` — without it Claude Code renders into the terminal alternate-screen buffer and **scroll + copy/paste break in the AB web terminal**. Canonical wrapper: `ab/scripts/claudes`. |
-| **OpenAI Codex CLI** | `codexs` (if present) or raw | `codex --full-auto` (alias `codex --yolo` in newer builds; use `codex exec --dangerously-bypass-approvals-and-sandbox` for non-TUI) | If `codexs` wrapper exists, prefer it (it'll set `CODEX_SANDBOX=danger-full-access` or equivalent). Verify with `which codexs`. |
+| **OpenAI Codex CLI** | `codexs` | `codex --sandbox danger-full-access --ask-for-approval never` | Use the wrapper. It sets the PTY label from `--ab-label` or the current folder and then applies the full-access flags. |
 | **Gemini CLI** | `geminis` (if present) or raw | `gemini --yolo` (auto-approves all prompts; alternatively `--approval-mode yolo`) | If `geminis` wrapper exists, prefer it. Verify with `which geminis`. |
 | **Other / unknown** | — | Ask user for the launch line | Don't guess; ask "какой бинарь и флаг полного доступа?" |
 

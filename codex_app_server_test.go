@@ -20,7 +20,7 @@ func TestShouldUseCodexAppServer(t *testing.T) {
 		{name: "already remote", cmd: []string{"codex", "--remote", "unix:///x"}, want: false},
 		{name: "already remote equals", cmd: []string{"codex", "--remote=unix:///x"}, want: false},
 		{name: "app server", cmd: []string{"codex", "app-server"}, want: false},
-		{name: "wrapper stays legacy", cmd: []string{"codexs"}, want: false},
+		{name: "canonical wrapper", cmd: []string{"codexs", "--ab-label", "payments"}, want: true},
 		{name: "shell", cmd: []string{"bash"}, want: false},
 	}
 

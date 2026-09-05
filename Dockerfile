@@ -21,7 +21,9 @@ WORKDIR /app
 COPY --from=builder /build/ab-pty .
 COPY claude-hooks-settings.json /app/claude-hooks.json
 COPY claude-hook-forwarder.sh /usr/local/bin/claude-hook-forwarder
-RUN chmod +x /usr/local/bin/claude-hook-forwarder
+COPY codexs /usr/local/bin/codexs
+RUN chmod +x /usr/local/bin/claude-hook-forwarder /usr/local/bin/codexs \
+    && ln -sf /app/ab-pty /usr/local/bin/ab
 
 ENV AB_PTY_PORT=8421
 ENV PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
