@@ -254,6 +254,46 @@ func TestCodexProxyForwardsWebSocketAndObservesStatus(t *testing.T) {
 	}
 }
 
+func TestCodexObserverResynchronizesAfterOversizedFrame(t *testing.T) {
+	const sessionID = "pty_codex_oversized_frame_test"
+	clearAiStatusForTest(sessionID)
+	t.Cleanup(func() { clearAiStatusForTest(sessionID) })
+
+	observer := &codexWebSocketObserver{
+		sessionID:         sessionID,
+		handshakeComplete: true,
+	}
+	payloadLength := uint64(maxCodexObservedMessage + 1)
+	header := make([]byte, 10)
+	header[0] = 0x81
+	header[1] = 127
+	binary.BigEndian.PutUint64(header[2:], payloadLength)
+	if _, err := observer.Write(header); err != nil {
+		t.Fatal(err)
+	}
+
+	chunk := make([]byte, 64<<10)
+	for remaining := payloadLength; remaining > 0; {
+		amount := uint64(len(chunk))
+		if amount > remaining {
+			amount = remaining
+		}
+		if _, err := observer.Write(chunk[:amount]); err != nil {
+			t.Fatal(err)
+		}
+		remaining -= amount
+	}
+
+	status := `{"method":"turn/started","params":{"threadId":"main"}}`
+	if _, err := observer.Write(testWebSocketTextFrame(status)); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := getAiStatusEntry(sessionID)
+	if !ok || !entry.Authoritative || entry.Status != "working" {
+		t.Fatalf("status after oversized frame = %#v, present=%v", entry, ok)
+	}
+}
+
 func testWebSocketTextFrame(payload string) []byte {
 	if len(payload) < 126 {
 		return append([]byte{0x81, byte(len(payload))}, payload...)

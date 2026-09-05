@@ -266,6 +266,8 @@ type codexWebSocketObserver struct {
 	buffer            []byte
 	handshakeComplete bool
 	fragmentedMessage []byte
+	skippedPayload    uint64
+	skippingFragment  bool
 }
 
 func (observer *codexWebSocketObserver) Write(data []byte) (int, error) {
@@ -284,7 +286,21 @@ func (observer *codexWebSocketObserver) Write(data []byte) (int, error) {
 		observer.handshakeComplete = true
 	}
 
-	for observer.consumeFrame() {
+	for {
+		if observer.skippedPayload > 0 {
+			available := uint64(len(observer.buffer))
+			if available > observer.skippedPayload {
+				available = observer.skippedPayload
+			}
+			observer.buffer = observer.buffer[available:]
+			observer.skippedPayload -= available
+			if observer.skippedPayload > 0 {
+				break
+			}
+		}
+		if !observer.consumeFrame() {
+			break
+		}
 	}
 	return written, nil
 }
@@ -315,14 +331,24 @@ func (observer *codexWebSocketObserver) consumeFrame() bool {
 		payloadLength = binary.BigEndian.Uint64(observer.buffer[2:10])
 		headerLength = 10
 	}
-
-	if payloadLength > maxCodexObservedMessage {
-		observer.buffer = nil
-		observer.fragmentedMessage = nil
-		return false
-	}
 	if masked {
 		headerLength += 4
+	}
+
+	if payloadLength > maxCodexObservedMessage {
+		if len(observer.buffer) < headerLength {
+			return false
+		}
+		// App-server startup responses can be tens of megabytes (for example,
+		// config/tool metadata). We do not need their payload, but we must skip
+		// it by its declared frame length. Dropping the current read buffer here
+		// loses WebSocket frame alignment whenever the payload spans reads, which
+		// also hides every later turn/started and turn/completed notification.
+		observer.buffer = observer.buffer[headerLength:]
+		observer.skippedPayload = payloadLength
+		observer.fragmentedMessage = nil
+		observer.skippingFragment = !final
+		return true
 	}
 	frameLength := uint64(headerLength) + payloadLength
 	if frameLength > uint64(len(observer.buffer)) {
@@ -340,18 +366,29 @@ func (observer *codexWebSocketObserver) consumeFrame() bool {
 
 	switch opcode {
 	case 0x1: // text
-		if final {
+		if observer.skippingFragment {
+			if final {
+				observer.skippingFragment = false
+			}
+		} else if final {
 			handleCodexAppServerMessage(observer.sessionID, payload)
 		} else {
 			observer.fragmentedMessage = append(observer.fragmentedMessage[:0], payload...)
 		}
 	case 0x0: // continuation
-		observer.fragmentedMessage = append(observer.fragmentedMessage, payload...)
-		if len(observer.fragmentedMessage) > maxCodexObservedMessage {
-			observer.fragmentedMessage = nil
-		} else if final {
-			handleCodexAppServerMessage(observer.sessionID, observer.fragmentedMessage)
-			observer.fragmentedMessage = nil
+		if observer.skippingFragment {
+			if final {
+				observer.skippingFragment = false
+			}
+		} else {
+			observer.fragmentedMessage = append(observer.fragmentedMessage, payload...)
+			if len(observer.fragmentedMessage) > maxCodexObservedMessage {
+				observer.fragmentedMessage = nil
+				observer.skippingFragment = !final
+			} else if final {
+				handleCodexAppServerMessage(observer.sessionID, observer.fragmentedMessage)
+				observer.fragmentedMessage = nil
+			}
 		}
 	}
 	return len(observer.buffer) > 0
