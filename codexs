@@ -4,9 +4,9 @@ set -euo pipefail
 # Canonical Codex launcher for AB PTY sessions.
 #
 # UI-created sessions pass --ab-label explicitly, so web and mobile use the
-# same launcher contract. A person starting `codexs` in an existing terminal
-# omits it and gets the current folder name. The AB-only option is consumed
-# here and never reaches Codex.
+# same launcher contract. A person starting plain `codexs` in an existing
+# terminal resumes the newest Codex conversation recorded for the current
+# folder. The AB-only option is consumed here and never reaches Codex.
 label=""
 label_supplied=0
 starts_app_server=0
@@ -37,6 +37,10 @@ while (($#)); do
   esac
 done
 
+if [[ "${starts_app_server}" -eq 0 && "${#codex_args[@]}" -eq 0 ]]; then
+  codex_args=(-C "$PWD" resume --last)
+fi
+
 if [[ -n "${AB_PTY_SESSION_ID:-}" && "${starts_app_server}" -eq 0 ]]; then
   if [[ "${label_supplied}" -eq 0 ]]; then
     label="$(basename -- "$PWD")"
@@ -49,4 +53,4 @@ if [[ -n "${AB_PTY_SESSION_ID:-}" && "${starts_app_server}" -eq 0 ]]; then
   fi
 fi
 
-exec codex --sandbox danger-full-access --ask-for-approval never "${codex_args[@]}"
+exec codex --dangerously-bypass-approvals-and-sandbox "${codex_args[@]}"
