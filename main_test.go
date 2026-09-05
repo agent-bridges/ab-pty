@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
@@ -821,6 +822,46 @@ func TestPtyLabelAPIStoresServerLabel(t *testing.T) {
 	}
 	if meta := getSessionMeta(session.ID); meta == nil || meta.Label != "my-label" {
 		t.Fatalf("session label was not persisted: %#v", meta)
+	}
+}
+
+func TestManualCodexRuntimeIsBoundToItsOwnPty(t *testing.T) {
+	const sessionID = "pty-manual-codex-runtime"
+	sessionsMu.Lock()
+	sessions[sessionID] = &Session{ID: sessionID, Alive: true}
+	sessionsMu.Unlock()
+	t.Cleanup(func() {
+		sessionsMu.Lock()
+		delete(sessions, sessionID)
+		sessionsMu.Unlock()
+		codexRuntimesMu.Lock()
+		delete(codexRuntimes, sessionID)
+		codexRuntimesMu.Unlock()
+	})
+
+	codexRuntimesMu.Lock()
+	codexRuntimes[sessionID] = &codexAppServerRuntime{
+		sessionID:   sessionID,
+		proxySocket: "/tmp/manual-codex-runtime.sock",
+	}
+	codexRuntimesMu.Unlock()
+
+	body := strings.NewReader(`{"cwd":"/tmp"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/pty/"+sessionID+"/codex-runtime", body)
+	req = req.WithContext(context.WithValue(req.Context(), authPrincipalContextKey{}, authPrincipal{SessionID: sessionID}))
+	w := httptest.NewRecorder()
+	handlePtyAPI(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"remote":"unix:///tmp/manual-codex-runtime.sock"`) {
+		t.Fatalf("own runtime request status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	otherBody := strings.NewReader(`{"cwd":"/tmp"}`)
+	otherReq := httptest.NewRequest(http.MethodPost, "/api/pty/"+sessionID+"/codex-runtime", otherBody)
+	otherReq = otherReq.WithContext(context.WithValue(otherReq.Context(), authPrincipalContextKey{}, authPrincipal{SessionID: "pty-other"}))
+	otherW := httptest.NewRecorder()
+	handlePtyAPI(otherW, otherReq)
+	if otherW.Code != http.StatusForbidden {
+		t.Fatalf("foreign runtime request status=%d body=%s", otherW.Code, otherW.Body.String())
 	}
 }
 

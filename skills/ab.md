@@ -63,7 +63,11 @@ Launch Codex through `codexs`. Web/mobile-created Codex sessions pass
 `--ab-label <chosen-name>` to that same wrapper. A manual `codexs` launch with
 no arguments takes the display label from the basename of the current folder
 and runs `codex -C "$PWD" resume --last`, which selects the newest session in
-that folder. The wrapper always adds
+that folder. Inside any existing AB shell, the wrapper asks the owning daemon
+for a per-PTY `codex app-server` runtime and connects through its observed Unix
+socket, so manually typed `codexs` gets authoritative `working`/`idle` status
+just like an app-created Codex terminal. Runtime setup fails closed; there is
+no heuristic fallback for this launch. The wrapper always adds
 `--dangerously-bypass-approvals-and-sandbox`; never launch a lower-permission
 Codex worker through this wrapper. Caller-supplied sandbox and approval flags
 are rejected so they cannot weaken this contract.
@@ -189,7 +193,7 @@ When sending the launch line via `ab sessions send <pty> "<command>"`, use the m
 | Agent | Local wrapper on this host | Underlying command | Notes |
 |---|---|---|---|
 | **Claude Code** | `claudes` (preferred) | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 IS_SANDBOX=1 claude --dangerously-skip-permissions` | Always use the wrapper, not raw `claude`. ⚠️ The wrapper MUST set `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` — without it Claude Code renders into the terminal alternate-screen buffer and **scroll + copy/paste break in the AB web terminal**. Canonical wrapper: `ab/scripts/claudes`. |
-| **OpenAI Codex CLI** | `codexs` | `codex --dangerously-bypass-approvals-and-sandbox -C "$PWD" resume --last` | Use the wrapper. Plain `codexs` resumes the latest session scoped to the current folder, sets the PTY label from that folder, and always runs with full permissions. |
+| **OpenAI Codex CLI** | `codexs` | `codex --dangerously-bypass-approvals-and-sandbox --remote <daemon-runtime> -C "$PWD" resume --last` | Use the wrapper. In any AB terminal it provisions the daemon-observed app-server runtime, resumes the latest session scoped to the current folder, sets the folder label, and always runs with full permissions. |
 | **Gemini CLI** | `geminis` (if present) or raw | `gemini --yolo` (auto-approves all prompts; alternatively `--approval-mode yolo`) | If `geminis` wrapper exists, prefer it. Verify with `which geminis`. |
 | **Other / unknown** | — | Ask user for the launch line | Don't guess; ask "какой бинарь и флаг полного доступа?" |
 

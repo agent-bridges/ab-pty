@@ -10,6 +10,7 @@ set -euo pipefail
 label=""
 label_supplied=0
 starts_app_server=0
+has_remote=0
 codex_args=()
 
 while (($#)); do
@@ -27,6 +28,17 @@ while (($#)); do
       ;;
     app-server)
       starts_app_server=1
+      codex_args+=("$1")
+      shift
+      ;;
+    --remote)
+      (($# >= 2)) || { echo "codexs: --remote requires a value" >&2; exit 2; }
+      has_remote=1
+      codex_args+=("$1" "$2")
+      shift 2
+      ;;
+    --remote=*)
+      has_remote=1
       codex_args+=("$1")
       shift
       ;;
@@ -62,6 +74,16 @@ if [[ -n "${AB_PTY_SESSION_ID:-}" && "${starts_app_server}" -eq 0 ]]; then
   if ! ab sessions label "${AB_PTY_SESSION_ID}" "${label}" >/dev/null; then
     echo "codexs: failed to set the PTY label" >&2
     exit 1
+  fi
+
+  if [[ "${has_remote}" -eq 0 ]]; then
+    runtime_uri=""
+    if ! runtime_uri="$(ab sessions codex-runtime "${AB_PTY_SESSION_ID}" --cwd "$PWD")"; then
+      echo "codexs: failed to start the daemon-owned Codex runtime" >&2
+      exit 1
+    fi
+    [[ "${runtime_uri}" == unix://* ]] || { echo "codexs: daemon returned an invalid Codex runtime address" >&2; exit 1; }
+    codex_args=(--remote "${runtime_uri}" "${codex_args[@]}")
   fi
 fi
 

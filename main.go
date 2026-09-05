@@ -1064,6 +1064,7 @@ Usage:
   ab sessions tail   [link/]<pty_id|name> [--lines N]  # alias: peek
   ab sessions rename [link/]<pty_id|name> <new-name>
   ab sessions label  [link/]<pty_id|name> <display-label>
+  ab sessions codex-runtime <pty_id> [--cwd PATH]      # internal: exact status for manual codexs
   ab sessions meta   [link/]<pty_id|name> [--set k=v ...]
   ab sessions lock   [link/]<pty_id|name>
   ab sessions unlock [link/]<pty_id|name>
@@ -1513,6 +1514,30 @@ func runClientSessions(args []string) {
 		out, err := sessionAPIRequest(link, "PATCH", "/api/pty/"+url.PathEscape(id)+"/label", body)
 		requireOK(err)
 		fmt.Println(string(out))
+	case "codex-runtime":
+		requireArg(rest, 0, "codex-runtime", "<pty_id> [--cwd PATH]")
+		if strings.Contains(rest[0], "/") {
+			requireOK(fmt.Errorf("codex-runtime is local to the current PTY daemon"))
+		}
+		cwd, err := os.Getwd()
+		requireOK(err)
+		for i := 1; i < len(rest); i++ {
+			if rest[i] == "--cwd" && i+1 < len(rest) {
+				cwd = rest[i+1]
+				i++
+			}
+		}
+		body, _ := json.Marshal(map[string]string{"cwd": cwd})
+		out, err := cliRequest("POST", "/api/pty/"+url.PathEscape(rest[0])+"/codex-runtime", body)
+		requireOK(err)
+		var response struct {
+			Remote string `json:"remote"`
+		}
+		requireOK(json.Unmarshal(out, &response))
+		if !strings.HasPrefix(response.Remote, "unix://") {
+			requireOK(fmt.Errorf("daemon returned an invalid Codex runtime address"))
+		}
+		fmt.Println(response.Remote)
 	case "key":
 		requireArg(rest, 1, "key", "[link/]<pty_id|name> <key>  (enter|tab|esc|backspace|up|down|left|right|ctrl-c|ctrl-d|...)")
 		link, target := resolve(rest[0])
@@ -2800,6 +2825,27 @@ func appendConfiguredPtyDaemonEnv(env []string) []string {
 	return env
 }
 
+func codexRuntimeSessionEnv(sessionID string) []string {
+	usr, _ := user.Current()
+	env := []string{
+		"HOME=" + usr.HomeDir,
+		"USER=" + usr.Username,
+		"LOGNAME=" + usr.Username,
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"FORCE_COLOR=1",
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
+	}
+	if tok := deriveSessionToken(sessionID); tok != "" {
+		env = append(env,
+			"AB_PTY_SESSION_ID="+sessionID,
+			"AB_PTY_SESSION_TOKEN="+tok,
+		)
+	}
+	return appendConfiguredPtyDaemonEnv(env)
+}
+
 func daemonPort() string {
 	if port := strings.TrimSpace(os.Getenv("AB_PTY_PORT")); port != "" {
 		return port
@@ -2897,7 +2943,7 @@ func createPtySession(projectPath string, rows, cols int, name, continueSession 
 
 	if shouldUseCodexAppServer(customCmd) {
 		sessionEnv := append([]string(nil), cmd.Env...)
-		rewritten, appServerErr := startCodexAppServer(sessionID, projectPath, sessionEnv, customCmd)
+		rewritten, appServerErr := ensureCodexAppServer(sessionID, projectPath, sessionEnv, customCmd)
 		if appServerErr != nil {
 			log.Printf("Codex app-server unavailable for %s, using legacy status tracking: %v", sessionID, appServerErr)
 		} else {
@@ -4611,7 +4657,7 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse path: /api/pty/{session_id}[/lock|/meta|/name|/label]. HTTP routing is
+	// Parse path: /api/pty/{session_id}[/lock|/meta|/name|/label|/codex-runtime]. HTTP routing is
 	// deliberately ID-only; name resolution belongs to the convenience CLI.
 	path := r.URL.Path[len("/api/pty/"):]
 	parts := filepath.SplitList(path)
@@ -4745,6 +4791,40 @@ func handlePtyAPI(w http.ResponseWriter, r *http.Request) {
 		meta := setSessionMeta(sessionID, nil, &label, nil, nil)
 		go broadcastPtyState()
 		writeJSON(w, 0, map[string]interface{}{"ok": true, "id": sessionID, "name": meta.Name, "label": meta.Label})
+
+	case action == "codex-runtime" && r.Method == http.MethodPost:
+		principal, ok := principalFromRequest(r)
+		if !ok || principal.SessionID == "" || principal.SessionID != sessionID {
+			writeError(w, http.StatusForbidden, "Codex runtime may only be requested by its own PTY session")
+			return
+		}
+		var body struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+		cwd := filepath.Clean(strings.TrimSpace(body.Cwd))
+		if !filepath.IsAbs(cwd) {
+			writeError(w, http.StatusBadRequest, "Codex runtime cwd must be an absolute path")
+			return
+		}
+		info, err := os.Stat(cwd)
+		if err != nil || !info.IsDir() {
+			writeError(w, http.StatusBadRequest, "Codex runtime cwd is not a directory")
+			return
+		}
+		rewritten, err := ensureCodexAppServer(sessionID, cwd, codexRuntimeSessionEnv(sessionID), []string{"codex"})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to start Codex app-server: "+err.Error())
+			return
+		}
+		if len(rewritten) < 3 || rewritten[1] != "--remote" || !strings.HasPrefix(rewritten[2], "unix://") {
+			writeError(w, http.StatusInternalServerError, "Codex app-server returned an invalid runtime address")
+			return
+		}
+		writeJSON(w, 0, map[string]interface{}{"ok": true, "remote": rewritten[2]})
 
 	case action == "name" && r.Method == "PATCH":
 		var body struct {

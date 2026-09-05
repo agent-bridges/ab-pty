@@ -29,7 +29,11 @@ func TestCodexWrapperDerivesAndAcceptsSessionLabel(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writeExecutable("ab", `printf '%s\n' "$@" > "$AB_CAPTURE"`)
+	writeExecutable("ab", `
+printf '%s\n' "$*" >> "$AB_CAPTURE"
+if [ "$1 $2" = "sessions codex-runtime" ]; then
+  printf '%s\n' 'unix:///tmp/codex-runtime.sock'
+fi`)
 	writeExecutable("codex", `printf '%s\n' "$@" > "$CODEX_CAPTURE"`)
 
 	run := func(extraArgs ...string) ([]string, []string) {
@@ -56,15 +60,20 @@ func TestCodexWrapperDerivesAndAcceptsSessionLabel(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return strings.Fields(string(abData)), strings.Split(strings.TrimSpace(string(codexData)), "\n")
+		return strings.Split(strings.TrimSpace(string(abData)), "\n"), strings.Split(strings.TrimSpace(string(codexData)), "\n")
 	}
 
 	abArgs, codexArgs := run()
-	if strings.Join(abArgs, " ") != "sessions label pty-test payments-api" {
+	wantAB := []string{
+		"sessions label pty-test payments-api",
+		"sessions codex-runtime pty-test --cwd " + projectDir,
+	}
+	if strings.Join(abArgs, "\x00") != strings.Join(wantAB, "\x00") {
 		t.Fatalf("derived label args = %q", abArgs)
 	}
 	wantDefault := []string{
 		"--dangerously-bypass-approvals-and-sandbox",
+		"--remote", "unix:///tmp/codex-runtime.sock",
 		"-C", projectDir,
 		"resume", "--last",
 	}
@@ -73,7 +82,7 @@ func TestCodexWrapperDerivesAndAcceptsSessionLabel(t *testing.T) {
 	}
 
 	abArgs, codexArgs = run("--remote", "unix:///tmp/codex.sock", "--ab-label", "mobile-name")
-	if strings.Join(abArgs, " ") != "sessions label pty-test mobile-name" {
+	if strings.Join(abArgs, "\x00") != "sessions label pty-test mobile-name" {
 		t.Fatalf("explicit label args = %q", abArgs)
 	}
 	if strings.Contains(strings.Join(codexArgs, " "), "--ab-label") {

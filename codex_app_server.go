@@ -34,8 +34,9 @@ type codexAppServerRuntime struct {
 }
 
 var (
-	codexRuntimesMu sync.Mutex
-	codexRuntimes   = map[string]*codexAppServerRuntime{}
+	codexRuntimesMu     sync.Mutex
+	codexRuntimes       = map[string]*codexAppServerRuntime{}
+	codexRuntimeStartMu sync.Mutex
 
 	// One Codex app-server may own several threads at once (the visible
 	// conversation plus sub-agents). Status notifications are scoped to a
@@ -201,6 +202,28 @@ func startCodexAppServer(sessionID, projectPath string, env, customCmd []string)
 	rewritten := []string{customCmd[0], "--remote", "unix://" + runtime.proxySocket}
 	rewritten = append(rewritten, customCmd[1:]...)
 	return rewritten, nil
+}
+
+// ensureCodexAppServer gives both app-created Codex terminals and a manual
+// `codexs` launched from an existing shell the same daemon-owned runtime. A
+// PTY has at most one app-server; later Codex launches reuse its proxy socket.
+func ensureCodexAppServer(sessionID, projectPath string, env, customCmd []string) ([]string, error) {
+	if !shouldUseCodexAppServer(customCmd) {
+		return customCmd, nil
+	}
+
+	codexRuntimeStartMu.Lock()
+	defer codexRuntimeStartMu.Unlock()
+
+	codexRuntimesMu.Lock()
+	runtime := codexRuntimes[sessionID]
+	codexRuntimesMu.Unlock()
+	if runtime != nil {
+		rewritten := []string{customCmd[0], "--remote", "unix://" + runtime.proxySocket}
+		return append(rewritten, customCmd[1:]...), nil
+	}
+
+	return startCodexAppServer(sessionID, projectPath, env, customCmd)
 }
 
 func (runtime *codexAppServerRuntime) acceptLoop() {
