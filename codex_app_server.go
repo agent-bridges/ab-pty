@@ -426,6 +426,18 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 	}
 
 	switch message.Method {
+	case "item/completed":
+		var params struct {
+			Item struct {
+				Type  string `json:"type"`
+				Text  string `json:"text"`
+				Phase string `json:"phase"`
+			} `json:"item"`
+		}
+		if json.Unmarshal(message.Params, &params) == nil &&
+			params.Item.Type == "agentMessage" && params.Item.Phase == "final_answer" {
+			rememberPushCompletionMessage(sessionID, params.Item.Text)
+		}
 	case "thread/status/changed":
 		var params struct {
 			ThreadID string            `json:"threadId"`
@@ -446,6 +458,7 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 			applyCodexThreadStatus(sessionID, params.Thread.ID, params.Thread.Status)
 		}
 	case "turn/started":
+		clearPushCompletionMessage(sessionID)
 		setCodexThreadActivity(sessionID, codexThreadID(message.Params), true)
 	case "turn/completed":
 		setCodexThreadActivity(sessionID, codexThreadID(message.Params), false)
@@ -517,6 +530,7 @@ func resetCodexActivity(sessionID string) {
 	codexActivityMu.Lock()
 	delete(codexActivities, sessionID)
 	codexActivityMu.Unlock()
+	clearPushCompletionMessage(sessionID)
 	setAiStatusAuthoritative(sessionID, "idle", "")
 }
 

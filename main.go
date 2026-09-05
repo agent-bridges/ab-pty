@@ -6466,6 +6466,7 @@ func clearAiStatus(ptyID string) {
 	aiStatusMu.Lock()
 	delete(aiStatuses, ptyID)
 	aiStatusMu.Unlock()
+	clearPushCompletionMessage(ptyID)
 	go broadcastPtyState()
 }
 

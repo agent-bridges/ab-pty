@@ -110,6 +110,31 @@ func TestCodexAppServerStatusEvents(t *testing.T) {
 		"idle")
 }
 
+func TestCodexAppServerRemembersFinalAnswerForPush(t *testing.T) {
+	const sessionID = "pty_codex_push_message_test"
+	clearAiStatusForTest(sessionID)
+	t.Cleanup(func() { clearAiStatusForTest(sessionID) })
+
+	handleCodexAppServerMessage(sessionID, []byte(
+		`{"method":"turn/started","params":{"threadId":"main"}}`,
+	))
+	handleCodexAppServerMessage(sessionID, []byte(
+		`{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"  Done.\n\nChanged three files.  ","phase":"final_answer"}}}`,
+	))
+	if got := pushCompletionMessage(sessionID); got != "Done. Changed three files." {
+		t.Fatalf("push completion message = %q", got)
+	}
+
+	// A new turn must not inherit the previous turn's answer if it fails
+	// before producing its own final message.
+	handleCodexAppServerMessage(sessionID, []byte(
+		`{"method":"turn/started","params":{"threadId":"main"}}`,
+	))
+	if got := pushCompletionMessage(sessionID); got != "" {
+		t.Fatalf("new turn retained stale push message %q", got)
+	}
+}
+
 func TestCodexAppServerAggregatesConcurrentThreads(t *testing.T) {
 	const sessionID = "pty_codex_multi_thread_test"
 	clearAiStatusForTest(sessionID)
@@ -350,6 +375,7 @@ func assertEventStatus(t *testing.T, sessionID, event, want string) {
 
 func clearAiStatusForTest(sessionID string) {
 	clearCodexActivity(sessionID)
+	clearPushCompletionMessage(sessionID)
 	aiStatusMu.Lock()
 	delete(aiStatuses, sessionID)
 	aiStatusMu.Unlock()

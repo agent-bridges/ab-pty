@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 func TestAuthoritativeCompletionRequiresWorkingToIdleEdge(t *testing.T) {
 	tests := []struct {
@@ -22,5 +26,20 @@ func TestAuthoritativeCompletionRequiresWorkingToIdleEdge(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestPushCompletionMessageIsWhitespaceNormalizedAndUTF8Safe(t *testing.T) {
+	const sessionID = "pty_push_message_test"
+	t.Cleanup(func() { clearPushCompletionMessage(sessionID) })
+	rememberPushCompletionMessage(sessionID, " one\n\n two\tthree ")
+	if got := pushCompletionMessage(sessionID); got != "one two three" {
+		t.Fatalf("normalized message = %q", got)
+	}
+
+	rememberPushCompletionMessage(sessionID, strings.Repeat("я", maxPushMessageBytes))
+	got := pushCompletionMessage(sessionID)
+	if !utf8.ValidString(got) || len(got) > maxPushMessageBytes {
+		t.Fatalf("truncated message is invalid: bytes=%d valid=%v", len(got), utf8.ValidString(got))
 	}
 }
