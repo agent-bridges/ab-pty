@@ -2242,6 +2242,7 @@ func initDB() {
 	// Relay configuration (see relayclient.go). Same reasoning: created
 	// unconditionally so `ab-pty relay status` answers everywhere.
 	initRelayTable()
+	initDaemonName()
 
 	// Explicit daemon-to-daemon links. A peer fingerprint is the identity;
 	// its relay is only the selected route to that identity.
@@ -2518,8 +2519,33 @@ func daemonName() string {
 			}
 		}
 	}
+	return configuredDaemonName()
+}
+
+func configuredDaemonName() string {
+	if name := strings.TrimSpace(os.Getenv(relayLabelEnv)); name != "" {
+		return name
+	}
+	if db != nil {
+		var name string
+		if err := db.QueryRow(`SELECT label FROM relay_configs WHERE TRIM(label) <> '' ORDER BY updated_at DESC, name LIMIT 1`).Scan(&name); err == nil {
+			if name = strings.TrimSpace(name); name != "" {
+				return name
+			}
+		}
+	}
 	hostname, _ := os.Hostname()
 	return strings.TrimSpace(hostname)
+}
+
+func initDaemonName() {
+	name := configuredDaemonName()
+	if name == "" {
+		name = "ab-pty"
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO daemon_settings (key, value) VALUES ('name', ?)`, name); err != nil {
+		log.Printf("daemon name: initialize: %v", err)
+	}
 }
 
 func validateDisplayLabel(kind, value string, allowEmpty bool) (string, error) {
