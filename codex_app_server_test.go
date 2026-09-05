@@ -114,12 +114,13 @@ func TestCodexAppServerRemembersFinalAnswerForPush(t *testing.T) {
 	const sessionID = "pty_codex_push_message_test"
 	clearAiStatusForTest(sessionID)
 	t.Cleanup(func() { clearAiStatusForTest(sessionID) })
+	selectCodexPushThread(sessionID, []byte(`{"id":"main","source":"cli"}`))
 
 	handleCodexAppServerMessage(sessionID, []byte(
-		`{"method":"turn/started","params":{"threadId":"main"}}`,
+		`{"method":"turn/started","params":{"threadId":"main","turn":{"id":"one"}}}`,
 	))
 	handleCodexAppServerMessage(sessionID, []byte(
-		`{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"  Done.\n\nChanged three files.  ","phase":"final_answer"}}}`,
+		`{"method":"item/completed","params":{"threadId":"main","turnId":"one","item":{"type":"agentMessage","text":"  Done.\n\nChanged three files.  ","phase":"final_answer"}}}`,
 	))
 	if got := pushCompletionMessage(sessionID); got != "Done. Changed three files." {
 		t.Fatalf("push completion message = %q", got)
@@ -128,7 +129,7 @@ func TestCodexAppServerRemembersFinalAnswerForPush(t *testing.T) {
 	// A new turn must not inherit the previous turn's answer if it fails
 	// before producing its own final message.
 	handleCodexAppServerMessage(sessionID, []byte(
-		`{"method":"turn/started","params":{"threadId":"main"}}`,
+		`{"method":"turn/started","params":{"threadId":"main","turn":{"id":"two"}}}`,
 	))
 	if got := pushCompletionMessage(sessionID); got != "" {
 		t.Fatalf("new turn retained stale push message %q", got)

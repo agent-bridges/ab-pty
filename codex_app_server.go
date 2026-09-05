@@ -246,7 +246,8 @@ func (runtime *codexAppServerRuntime) proxy(client net.Conn) {
 	defer server.Close()
 
 	go func() {
-		_, _ = io.Copy(server, client)
+		observer := &codexWebSocketObserver{sessionID: runtime.sessionID, clientMessages: true}
+		_, _ = io.Copy(io.MultiWriter(server, observer), client)
 		if unixConn, ok := server.(*net.UnixConn); ok {
 			_ = unixConn.CloseWrite()
 		}
@@ -263,6 +264,7 @@ const maxCodexObservedMessage = 16 << 20
 // sees them, so a parser bug cannot alter the terminal protocol.
 type codexWebSocketObserver struct {
 	sessionID         string
+	clientMessages    bool
 	buffer            []byte
 	handshakeComplete bool
 	fragmentedMessage []byte
@@ -390,7 +392,7 @@ func (observer *codexWebSocketObserver) consumeFrame() bool {
 				observer.skippingFragment = false
 			}
 		} else if final {
-			handleCodexAppServerMessage(observer.sessionID, payload)
+			observer.observeMessage(payload)
 		} else {
 			observer.fragmentedMessage = append(observer.fragmentedMessage[:0], payload...)
 		}
@@ -405,7 +407,7 @@ func (observer *codexWebSocketObserver) consumeFrame() bool {
 				observer.fragmentedMessage = nil
 				observer.skippingFragment = !final
 			} else if final {
-				handleCodexAppServerMessage(observer.sessionID, observer.fragmentedMessage)
+				observer.observeMessage(observer.fragmentedMessage)
 				observer.fragmentedMessage = nil
 			}
 		}
@@ -413,12 +415,42 @@ func (observer *codexWebSocketObserver) consumeFrame() bool {
 	return len(observer.buffer) > 0
 }
 
+func (observer *codexWebSocketObserver) observeMessage(payload []byte) {
+	if observer.clientMessages {
+		handleCodexClientMessage(observer.sessionID, payload)
+	} else {
+		handleCodexAppServerMessage(observer.sessionID, payload)
+	}
+}
+
+// The TUI explicitly names its visible thread when resuming or sending input.
+// Observe that tiny request, so even a huge skipped resume-history response
+// cannot leave push ownership unknown. A thread/read response is NOT selection.
+func handleCodexClientMessage(sessionID string, payload []byte) {
+	var message struct {
+		Method string `json:"method"`
+		Params struct {
+			ThreadID string `json:"threadId"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(payload, &message) != nil || message.Params.ThreadID == "" {
+		return
+	}
+	switch message.Method {
+	case "thread/resume", "turn/start", "turn/steer":
+		selectCodexPushThreadID(sessionID, message.Params.ThreadID)
+	}
+}
+
 func handleCodexAppServerMessage(sessionID string, line []byte) {
 	var message struct {
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
 	}
-	if err := json.Unmarshal(line, &message); err != nil || message.Method == "" {
+	if err := json.Unmarshal(line, &message); err != nil {
+		return
+	}
+	if message.Method == "" {
 		return
 	}
 	if codexAppServerTraceEnabled(sessionID) {
@@ -428,7 +460,9 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 	switch message.Method {
 	case "item/completed":
 		var params struct {
-			Item struct {
+			ThreadID string `json:"threadId"`
+			TurnID   string `json:"turnId"`
+			Item     struct {
 				Type  string `json:"type"`
 				Text  string `json:"text"`
 				Phase string `json:"phase"`
@@ -436,7 +470,7 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 		}
 		if json.Unmarshal(message.Params, &params) == nil &&
 			params.Item.Type == "agentMessage" && params.Item.Phase == "final_answer" {
-			rememberPushCompletionMessage(sessionID, params.Item.Text)
+			recordCodexPushMessage(sessionID, params.ThreadID, params.TurnID, params.Item.Text)
 		}
 	case "thread/status/changed":
 		var params struct {
@@ -448,6 +482,12 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 		}
 		applyCodexThreadStatus(sessionID, params.ThreadID, params.Status)
 	case "thread/started":
+		var raw struct {
+			Thread json.RawMessage `json:"thread"`
+		}
+		if json.Unmarshal(message.Params, &raw) == nil {
+			selectCodexPushThread(sessionID, raw.Thread)
+		}
 		var params struct {
 			Thread struct {
 				ID     string            `json:"id"`
@@ -458,10 +498,28 @@ func handleCodexAppServerMessage(sessionID string, line []byte) {
 			applyCodexThreadStatus(sessionID, params.Thread.ID, params.Thread.Status)
 		}
 	case "turn/started":
-		clearPushCompletionMessage(sessionID)
+		var params struct {
+			ThreadID string `json:"threadId"`
+			Turn     struct {
+				ID string `json:"id"`
+			} `json:"turn"`
+		}
+		if json.Unmarshal(message.Params, &params) == nil {
+			beginCodexPushTurn(sessionID, params.ThreadID, params.Turn.ID)
+		}
 		setCodexThreadActivity(sessionID, codexThreadID(message.Params), true)
 	case "turn/completed":
 		setCodexThreadActivity(sessionID, codexThreadID(message.Params), false)
+		var params struct {
+			ThreadID string `json:"threadId"`
+			Turn     struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			} `json:"turn"`
+		}
+		if json.Unmarshal(message.Params, &params) == nil {
+			completeCodexPushTurn(sessionID, params.ThreadID, params.Turn.ID, params.Turn.Status)
+		}
 	}
 }
 

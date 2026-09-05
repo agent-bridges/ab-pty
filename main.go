@@ -6457,9 +6457,6 @@ func setAiStatusAuthoritative(ptyID, status, tool string) {
 	aiStatuses[ptyID] = next
 	aiStatusMu.Unlock()
 	go broadcastPtyState()
-	if authoritativeCompletion(previous, hadPrevious, status) {
-		schedulePushCompletion(ptyID, next.UpdatedAt)
-	}
 }
 
 func clearAiStatus(ptyID string) {
